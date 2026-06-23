@@ -1,0 +1,30 @@
+data:
+  train_dir:
+  train_csv:
+  image_root:
+  val_fraction: 0.5
+  folds: 1
+  seed: 7
+  num_workers: 0
+  augment_policy: standard
+  transform_backend: auto
+model:
+  name: small_cnn
+  image_size: 64
+  pretrained: false
+  dropout: 0.0
+train:
+  epochs: 1
+  batch_size: 2
+  lr: 0.001
+  weight_decay: 0.0
+  label_smoothing: 0.0
+  amp: false
+  mixup_alpha: 0.0
+  cutmix_alpha: 0.0
+  ema_decay: 0.0
+  output_dir: outputs/smoke
+infer:
+  batch_size: 4
+  tta: false
+  output_csv: outputs/smoke_submission.csv
