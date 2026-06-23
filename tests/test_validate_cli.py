@@ -22,3 +22,31 @@ def test_validate_parse_args_accepts_errors_csv(monkeypatch) -> None:
     args = parse_args()
 
     assert args.errors_csv == Path("errors.csv")
+
+
+def test_infer_parse_args_accepts_submission_schema_controls(monkeypatch) -> None:
+    from infer import parse_args
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "infer.py",
+            "--checkpoint",
+            "model.pt",
+            "--test-dir",
+            "test",
+            "--sample-submission",
+            "sample_submission.csv",
+            "--image-column",
+            "id",
+            "--label-column",
+            "weather",
+        ],
+    )
+
+    args = parse_args()
+
+    assert args.sample_submission == Path("sample_submission.csv")
+    assert args.image_column == "id"
+    assert args.label_column == "weather"

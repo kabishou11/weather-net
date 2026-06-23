@@ -4,6 +4,7 @@ import csv
 import json
 from dataclasses import dataclass
 from pathlib import Path
+from collections import Counter
 from typing import Iterable, Sequence
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
@@ -102,7 +103,7 @@ def build_manifest_from_csv(
     fieldnames = list(rows[0].keys())
     image_column = image_column or _pick_column(
         fieldnames,
-        ["image", "filename", "file", "path", "img_path", "image_path"],
+        ["image", "id", "image_id", "filename", "file", "path", "img_path", "image_path"],
         "image path",
     )
     label_column = label_column or _pick_column(
@@ -163,7 +164,7 @@ def build_unlabeled_manifest_from_csv(
     fieldnames = list(rows[0].keys())
     image_column = image_column or _pick_column(
         fieldnames,
-        ["image", "filename", "file", "path", "img_path", "image_path"],
+        ["image", "id", "image_id", "filename", "file", "path", "img_path", "image_path"],
         "image path",
     )
     image_root = (image_root or csv_path.parent).expanduser().resolve()
@@ -212,13 +213,17 @@ def split_train_val(
     import random
 
     by_label: dict[int, list[ManifestRow]] = {}
+    forced_train_rows: list[ManifestRow] = []
     for row in rows:
         if row.label is None:
             raise ValueError("Cannot split unlabeled rows")
+        if row.source == "pseudo":
+            forced_train_rows.append(row)
+            continue
         by_label.setdefault(row.label, []).append(row)
 
     rng = random.Random(seed)
-    train_rows: list[ManifestRow] = []
+    train_rows: list[ManifestRow] = list(forced_train_rows)
     val_rows: list[ManifestRow] = []
     for label_rows in by_label.values():
         shuffled = list(label_rows)
@@ -236,6 +241,47 @@ def split_train_val(
     )
 
 
+def _effective_kfold_count(rows: Sequence[ManifestRow], requested_folds: int) -> int:
+    labels = [row.label for row in rows]
+    if any(label is None for label in labels):
+        raise ValueError("Cannot split unlabeled rows")
+    label_counts = Counter(int(label) for label in labels if label is not None)
+    if len(label_counts) < 2:
+        raise ValueError("At least two classes are required for k-fold training")
+    smallest_class = min(label_counts.values())
+    if smallest_class < 2:
+        return 1
+    return min(requested_folds, smallest_class)
+
+
+def _fallback_stratified_kfold_indices(
+    rows: Sequence[ManifestRow],
+    folds: int,
+    seed: int,
+) -> Iterable[tuple[list[int], list[int]]]:
+    import random
+
+    by_label: dict[int, list[int]] = {}
+    for idx, row in enumerate(rows):
+        if row.label is None:
+            raise ValueError("Cannot split unlabeled rows")
+        by_label.setdefault(row.label, []).append(idx)
+
+    rng = random.Random(seed)
+    val_indices_by_fold: list[list[int]] = [[] for _ in range(folds)]
+    for label_indices in by_label.values():
+        shuffled = list(label_indices)
+        rng.shuffle(shuffled)
+        for offset, idx in enumerate(shuffled):
+            val_indices_by_fold[offset % folds].append(idx)
+
+    all_indices = set(range(len(rows)))
+    for val_indices in val_indices_by_fold:
+        val_set = set(val_indices)
+        train_indices = sorted(all_indices - val_set)
+        yield train_indices, sorted(val_indices)
+
+
 def iter_kfold_splits(
     rows: Sequence[ManifestRow],
     folds: int,
@@ -244,20 +290,27 @@ def iter_kfold_splits(
     if folds < 2:
         raise ValueError("folds must be at least 2")
 
+    labeled_rows = [row for row in rows if row.source != "pseudo"]
+    pseudo_rows = [row for row in rows if row.source == "pseudo"]
+    effective_folds = _effective_kfold_count(labeled_rows, folds)
+    if effective_folds < 2:
+        train_rows, val_rows = split_train_val(rows, val_fraction=1.0 / folds, seed=seed)
+        yield 0, train_rows, val_rows
+        return
+
+    indices = list(range(len(labeled_rows)))
+    labels = [row.label for row in labeled_rows]
     try:
         from sklearn.model_selection import StratifiedKFold
-    except Exception as exc:  # pragma: no cover - exercised in lean environments.
-        raise RuntimeError("Install scikit-learn to use k-fold training") from exc
 
-    labels = [row.label for row in rows]
-    if any(label is None for label in labels):
-        raise ValueError("Cannot split unlabeled rows")
+        splitter = StratifiedKFold(n_splits=effective_folds, shuffle=True, random_state=seed)
+        split_indices = splitter.split(indices, labels)
+    except Exception:
+        split_indices = _fallback_stratified_kfold_indices(labeled_rows, folds=effective_folds, seed=seed)
 
-    splitter = StratifiedKFold(n_splits=folds, shuffle=True, random_state=seed)
-    indices = list(range(len(rows)))
-    for fold_idx, (train_idx, val_idx) in enumerate(splitter.split(indices, labels)):
+    for fold_idx, (train_idx, val_idx) in enumerate(split_indices):
         yield (
             fold_idx,
-            [rows[idx] for idx in train_idx],
-            [rows[idx] for idx in val_idx],
+            sorted([labeled_rows[idx] for idx in train_idx] + pseudo_rows, key=lambda row: str(row.path)),
+            sorted([labeled_rows[idx] for idx in val_idx], key=lambda row: str(row.path)),
         )

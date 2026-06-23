@@ -32,7 +32,11 @@ def load_unlabeled_rows(
             image_column=image_column,
         )
     if test_dir is not None:
-        return [ManifestRow(path=path) for path in list_images(test_dir)]
+        root = test_dir.expanduser().resolve()
+        return [
+            ManifestRow(path=path, image_id=path.relative_to(root).as_posix(), source="unlabeled")
+            for path in list_images(root)
+        ]
     raise ValueError("Set test_dir or test_csv")
 
 
@@ -188,8 +192,8 @@ def predict_logits(
     num_workers: int = 2,
     checkpoint_weights: Sequence[float] | None = None,
     transform_backend: str = "auto",
-) -> tuple[list[Path], list[str], dict[str, object]]:
-    image_paths, probabilities, class_names, _, stats = predict_probabilities(
+) -> tuple[list[Path], list[str], list[str], dict[str, object]]:
+    image_paths, probabilities, class_names, image_ids, stats = predict_probabilities(
         checkpoints=checkpoints,
         rows=rows,
         batch_size=batch_size,
@@ -200,7 +204,7 @@ def predict_logits(
         transform_backend=transform_backend,
     )
     predictions = [class_names[max(range(len(row)), key=lambda idx: row[idx])] for row in probabilities]
-    return image_paths, predictions, stats
+    return image_paths, predictions, image_ids, stats
 
 
 def run_inference(
@@ -216,6 +220,9 @@ def run_inference(
     num_workers: int = 2,
     checkpoint_weights: Sequence[float] | None = None,
     transform_backend: str = "auto",
+    sample_submission_path: Path | None = None,
+    output_image_column: str = "image",
+    output_label_column: str = "label",
 ) -> dict[str, object]:
     rows = load_unlabeled_rows(
         test_dir=test_dir,
@@ -223,7 +230,7 @@ def run_inference(
         image_root=image_root,
         image_column=image_column,
     )
-    image_paths, predictions, stats = predict_logits(
+    image_paths, predictions, image_ids, stats = predict_logits(
         checkpoints=checkpoints,
         rows=rows,
         batch_size=batch_size,
@@ -233,18 +240,14 @@ def run_inference(
         checkpoint_weights=checkpoint_weights,
         transform_backend=transform_backend,
     )
-    rows_for_ids = load_unlabeled_rows(
-        test_dir=test_dir,
-        test_csv=test_csv,
-        image_root=image_root,
-        image_column=image_column,
-    )
-    image_ids = [row.image_id or row.path.name for row in rows_for_ids]
     write_submission(
         output_path=output_csv,
         image_paths=image_paths,
         predictions=predictions,
         image_ids=image_ids,
+        image_column=output_image_column,
+        label_column=output_label_column,
+        sample_submission_path=sample_submission_path,
     )
     stats_path = output_csv.with_suffix(".stats.json")
     stats_path.write_text(json.dumps(stats, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")

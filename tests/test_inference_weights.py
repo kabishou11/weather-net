@@ -2,6 +2,7 @@ from pathlib import Path
 import inspect
 
 import pytest
+from PIL import Image
 
 
 def test_normalize_checkpoint_weights_defaults_to_equal_weights() -> None:
@@ -30,3 +31,22 @@ def test_predict_logits_accepts_transform_backend_argument() -> None:
     from src.weather_net.inference import predict_logits
 
     assert "transform_backend" in inspect.signature(predict_logits).parameters
+
+
+def _make_image(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", (8, 8), (12, 34, 56)).save(path)
+
+
+def test_load_unlabeled_rows_from_directory_uses_relative_image_ids(tmp_path: Path) -> None:
+    from src.weather_net.inference import load_unlabeled_rows
+
+    _make_image(tmp_path / "test" / "station_a" / "frame.jpg")
+    _make_image(tmp_path / "test" / "station_b" / "frame.jpg")
+
+    rows = load_unlabeled_rows(test_dir=tmp_path / "test")
+
+    assert [row.image_id for row in rows] == [
+        "station_a/frame.jpg",
+        "station_b/frame.jpg",
+    ]
