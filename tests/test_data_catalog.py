@@ -42,6 +42,25 @@ def test_csv_manifest_respects_existing_class_mapping(tmp_path: Path) -> None:
     assert all(row.path.is_absolute() for row in manifest)
 
 
+def test_training_csv_prefers_filename_over_id_primary_key(tmp_path: Path) -> None:
+    from src.weather_net.data import build_manifest_from_csv
+
+    _make_image(tmp_path / "images" / "rain.jpg")
+    _make_image(tmp_path / "images" / "sunny.jpg")
+    csv_path = tmp_path / "train.csv"
+    csv_path.write_text(
+        "id,filename,label\n"
+        "100,rain.jpg,rain\n"
+        "101,sunny.jpg,sunny\n",
+        encoding="utf-8",
+    )
+
+    manifest, _ = build_manifest_from_csv(csv_path, image_root=tmp_path / "images")
+
+    assert [row.image_id for row in manifest] == ["rain.jpg", "sunny.jpg"]
+    assert [row.path.name for row in manifest] == ["rain.jpg", "sunny.jpg"]
+
+
 def test_image_folder_manifest_respects_existing_class_mapping(tmp_path: Path) -> None:
     from src.weather_net.data import build_manifest_from_image_folder
 

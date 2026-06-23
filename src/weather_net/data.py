@@ -103,7 +103,7 @@ def build_manifest_from_csv(
     fieldnames = list(rows[0].keys())
     image_column = image_column or _pick_column(
         fieldnames,
-        ["image", "id", "image_id", "filename", "file", "path", "img_path", "image_path"],
+        ["image", "filename", "file", "path", "img_path", "image_path", "image_id", "id"],
         "image path",
     )
     label_column = label_column or _pick_column(
