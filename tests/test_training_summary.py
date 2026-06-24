@@ -542,6 +542,23 @@ def test_load_training_manifest_uses_official_class_map_for_csv(tmp_path) -> Non
     assert rows[0].label == 1
 
 
+def test_load_training_manifest_requires_class_map_for_csv(tmp_path) -> None:
+    import pytest
+
+    from src.weather_net.config import AppConfig
+    from src.weather_net.training import load_training_manifest
+
+    train_csv = tmp_path / "train.csv"
+    train_csv.write_text("image,label\nsunny.jpg,sunny\n", encoding="utf-8")
+
+    config = AppConfig()
+    config.data.train_csv = train_csv
+    config.data.image_root = tmp_path
+
+    with pytest.raises(ValueError, match="data.class_map"):
+        load_training_manifest(config)
+
+
 def test_load_training_manifest_rejects_csv_label_outside_official_class_map(tmp_path) -> None:
     import json
     import pytest

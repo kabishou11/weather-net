@@ -176,6 +176,11 @@ def load_training_manifest(config: AppConfig) -> tuple[list[ManifestRow], dict[s
     if config.data.train_dir is not None:
         return build_manifest_from_image_folder(config.data.train_dir, class_to_idx=class_to_idx)
     if config.data.train_csv is not None:
+        if class_to_idx is None:
+            raise ValueError(
+                "data.class_map is required when training from CSV; bootstrap the official class map "
+                "from an ImageFolder run or provide the saved class_to_idx.json"
+            )
         return build_manifest_from_csv(
             config.data.train_csv,
             image_root=config.data.image_root,

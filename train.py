@@ -13,6 +13,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-dir", type=Path, default=None)
     parser.add_argument("--train-csv", type=Path, default=None)
     parser.add_argument("--image-root", type=Path, default=None)
+    parser.add_argument("--class-map", type=Path, default=None)
     parser.add_argument("--model", type=str, default=None)
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
@@ -31,6 +32,8 @@ def main() -> None:
         config.data.train_csv = args.train_csv
     if args.image_root is not None:
         config.data.image_root = args.image_root
+    if args.class_map is not None:
+        config.data.class_map = args.class_map
     if args.model is not None:
         config.model.name = args.model
     if args.epochs is not None:

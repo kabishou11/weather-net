@@ -28,6 +28,8 @@ yyy.jpg,sunny
 
 ## 训练
 
+如果官方数据先以 ImageFolder 训练，首轮会在 `--output-dir` 下生成 `class_to_idx.json`。如果官方数据只提供 CSV，先手工准备或用一次官方类表生成 `outputs/official/class_to_idx.json`；后续所有 CSV 训练都必须通过 `--class-map` 使用同一份官方映射。
+
 ```bash
 python3 train.py \
   --config configs/convnext_tiny.yaml \
@@ -43,6 +45,7 @@ CSV 训练：
 python3 train.py \
   --train-csv data/train.csv \
   --image-root data/images \
+  --class-map outputs/official/class_to_idx.json \
   --config configs/convnext_tiny.yaml
 ```
 
@@ -52,6 +55,7 @@ python3 train.py \
 python3 train.py \
   --train-csv data/train.csv \
   --image-root data/images \
+  --class-map outputs/official/class_to_idx.json \
   --config configs/convnextv2_384.yaml
 ```
 
@@ -63,6 +67,7 @@ python3 train.py \
 python3 train.py \
   --train-csv data/train.csv \
   --image-root data/images \
+  --class-map outputs/official/class_to_idx.json \
   --config configs/convnextv2_384_balanced_softmax.yaml
 ```
 
@@ -74,6 +79,7 @@ python3 train.py \
 python3 train.py \
   --train-csv data/train.csv \
   --image-root data/images \
+  --class-map outputs/official/class_to_idx.json \
   --config configs/convnextv2_384_ldam.yaml
 ```
 
@@ -85,6 +91,7 @@ python3 train.py \
 python3 train.py \
   --train-csv data/train.csv \
   --image-root data/images \
+  --class-map outputs/official/class_to_idx.json \
   --config configs/convnextv2_384_augmix_jsd.yaml
 ```
 
@@ -418,6 +425,7 @@ python3 merge_pseudo_labels.py \
 python3 train.py \
   --config configs/convnext_tiny.yaml \
   --train-csv merged_train.csv \
+  --class-map outputs/official/class_to_idx.json \
   --epochs 5 \
   --output-dir outputs/convnext_pseudo
 ```
@@ -595,7 +603,7 @@ data:
   external_audit_json: outputs/preflight_train_with_external_common5_audit.json
 ```
 
-训练入口会 fail-closed：只要 CSV 中包含 `source=external` 或 `external_*`，但没有匹配 `merge_external_training.py` 产出的 audit，就会拒绝开训，避免把外部-only 或未经官方去重的 CSV 跑成一次长训练。训练配置建议始终设置 `data.class_map` 指向官方训练首次生成的 `class_to_idx.json`，后续 OOF teacher、外部合并、hard mining、蒸馏和提交推理都沿用同一份映射，避免 CSV 标签推断导致分类头顺序漂移。
+训练入口会 fail-closed：只要 CSV 中包含 `source=external` 或 `external_*`，但没有匹配 `merge_external_training.py` 产出的 audit，就会拒绝开训，避免把外部-only 或未经官方去重的 CSV 跑成一次长训练。所有 CSV 训练必须设置 `data.class_map` 或命令行 `--class-map`，指向官方训练首次生成的 `class_to_idx.json`；首个官方 ImageFolder 训练可用于 bootstrap 这份映射。后续 OOF teacher、外部合并、hard mining、蒸馏和提交推理都沿用同一份映射，避免 CSV 标签推断导致分类头顺序漂移。
 
 ## 一次性服务器训练路线
 
