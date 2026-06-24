@@ -232,6 +232,13 @@ def freeze_all_model_parameters(model: torch.nn.Module) -> None:
         parameter.requires_grad_(False)
 
 
+def _unpack_supervised_batch(batch) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if not isinstance(batch, (tuple, list)) or len(batch) < 3:
+        raise ValueError("supervised batch must contain images, targets, and sample weights")
+    images, targets, sample_weights = batch[:3]
+    return images, targets, sample_weights
+
+
 def train_lws_one_epoch(
     model: torch.nn.Module,
     loader: DataLoader,
@@ -243,7 +250,8 @@ def train_lws_one_epoch(
     criterion = torch.nn.CrossEntropyLoss(reduction="none")
     total_loss = 0.0
     total_items = 0
-    for images, targets, sample_weights in loader:
+    for batch in loader:
+        images, targets, sample_weights = _unpack_supervised_batch(batch)
         images = images.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
         sample_weights = sample_weights.to(device, non_blocking=True)

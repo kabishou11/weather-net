@@ -560,3 +560,29 @@ def test_train_lws_one_epoch_updates_only_scales() -> None:
     for name, param in model.named_parameters():
         assert param.requires_grad is False
         assert torch.equal(param.detach(), before[name])
+
+
+def test_train_lws_one_epoch_accepts_weather_dataset_four_tuple_batches() -> None:
+    from torch import nn
+    from torch.utils.data import DataLoader, TensorDataset
+
+    from classifier_rebalance import freeze_all_model_parameters, train_lws_one_epoch
+
+    model = nn.Linear(2, 2)
+    freeze_all_model_parameters(model)
+    loader = DataLoader(
+        TensorDataset(
+            torch.tensor([[2.0, 0.0], [0.0, 2.0]]),
+            torch.tensor([0, 1]),
+            torch.ones(2),
+            torch.empty(2, 0),
+        ),
+        batch_size=2,
+    )
+    scales = torch.nn.Parameter(torch.zeros(2))
+    optimizer = torch.optim.SGD([scales], lr=0.1)
+
+    loss = train_lws_one_epoch(model, loader, optimizer, device="cpu", lws_log_scales=scales)
+
+    assert loss > 0
+    assert scales.grad is not None

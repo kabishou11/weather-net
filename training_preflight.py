@@ -20,6 +20,8 @@ def _load_rows(
     train_csv: Path | None,
     train_dir: Path | None,
     image_root: Path | None,
+    class_map: Path | None,
+    require_class_map_for_csv: bool = False,
 ) -> tuple[list[ManifestRow], dict[str, int]]:
     if train_csv is not None:
         config.data.train_csv = train_csv
@@ -27,15 +29,24 @@ def _load_rows(
         config.data.train_dir = train_dir
     if image_root is not None:
         config.data.image_root = image_root
+    if class_map is not None:
+        config.data.class_map = class_map
+
+    class_to_idx = load_class_mapping(config.data.class_map) if config.data.class_map is not None else None
 
     if config.data.train_csv is not None and config.data.train_dir is not None:
         raise ValueError("preflight requires either --train-csv or --train-dir, not both")
     if config.data.train_dir is not None:
-        return build_manifest_from_image_folder(config.data.train_dir)
+        return build_manifest_from_image_folder(config.data.train_dir, class_to_idx=class_to_idx)
     if config.data.train_csv is not None:
+        if require_class_map_for_csv and class_to_idx is None:
+            raise ValueError(
+                "server-strict preflight requires data.class_map or --class-map for CSV training"
+            )
         return build_manifest_from_csv(
             config.data.train_csv,
             image_root=config.data.image_root,
+            class_to_idx=class_to_idx,
             image_column=config.data.image_column,
             label_column=config.data.label_column,
         )
@@ -321,6 +332,7 @@ def _validate_inference_budget(
 
 def run_preflight_checks(
     config_path: Path | None,
+    profile: str = "custom",
     train_csv: Path | None = None,
     train_dir: Path | None = None,
     image_root: Path | None = None,
@@ -345,12 +357,36 @@ def run_preflight_checks(
     max_checkpoints: int = 1,
     allow_tta: bool = False,
 ) -> dict[str, Any]:
+    if profile not in {"custom", "server-strict"}:
+        raise ValueError("profile must be one of: custom, server-strict")
+    if profile == "server-strict":
+        check_image_exists = True
+        check_readable_images = True
+        check_unique_image_id = True
+        check_unique_realpath = True
+        check_unique_image_hash = True
+        if external_max_ratio is None:
+            external_max_ratio = 0.5
+        if external_max_sample_weight is None:
+            external_max_sample_weight = 0.5
+        if pseudo_min_confidence is None:
+            pseudo_min_confidence = 0.95
+        if pseudo_max_ratio is None:
+            pseudo_max_ratio = 0.5
+        if min_labeled_images_per_class is None:
+            min_labeled_images_per_class = 2
+        if inference_stats is not None and max_seconds_per_image is None:
+            max_seconds_per_image = 0.05
+
     config = load_config(config_path if config_path is not None else None)
-    rows, class_to_idx = _load_rows(config, train_csv=train_csv, train_dir=train_dir, image_root=image_root)
-    if class_map is not None:
-        expected_mapping = load_class_mapping(class_map)
-        if class_to_idx != expected_mapping:
-            raise ValueError("class mapping differs from --class-map")
+    rows, class_to_idx = _load_rows(
+        config,
+        train_csv=train_csv,
+        train_dir=train_dir,
+        image_root=image_root,
+        class_map=class_map,
+        require_class_map_for_csv=profile == "server-strict",
+    )
     label_counts = _validate_class_support(
         rows,
         class_to_idx,
@@ -392,6 +428,7 @@ def run_preflight_checks(
 
     return {
         "status": "pass",
+        "profile": profile,
         "config": str(config_path) if config_path is not None else None,
         "rows": len(rows),
         "classes": idx_to_class(class_to_idx),
@@ -408,6 +445,7 @@ def run_preflight_checks(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run server-training preflight checks before expensive weather runs.")
     parser.add_argument("--config", type=Path, default=Path("configs/convnextv2_384.yaml"))
+    parser.add_argument("--profile", choices=["custom", "server-strict"], default="custom")
     parser.add_argument("--train-csv", type=Path, default=None)
     parser.add_argument("--train-dir", type=Path, default=None)
     parser.add_argument("--image-root", type=Path, default=None)
@@ -439,6 +477,7 @@ def main() -> None:
     args = parse_args()
     result = run_preflight_checks(
         config_path=args.config,
+        profile=args.profile,
         train_csv=args.train_csv,
         train_dir=args.train_dir,
         image_root=args.image_root,

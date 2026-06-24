@@ -4,9 +4,9 @@ import pytest
 from PIL import Image
 
 
-def _make_image(path: Path) -> None:
+def _make_image(path: Path, color: tuple[int, int, int] = (120, 120, 120)) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    Image.new("RGB", (8, 8), (120, 120, 120)).save(path)
+    Image.new("RGB", (8, 8), color).save(path)
 
 
 def test_preflight_rejects_external_rows_without_explicit_allowance(tmp_path: Path) -> None:
@@ -186,9 +186,93 @@ def test_preflight_passes_clean_training_manifest(tmp_path: Path) -> None:
     )
 
     assert result["status"] == "pass"
+    assert result["profile"] == "custom"
     assert result["rows"] == 2
     assert result["classes"] == ["rain", "sunny"]
     assert result["teacher_distillation"] == {"enabled": True, "rows_with_teacher": 2}
+
+
+def test_preflight_uses_class_map_when_loading_csv(tmp_path: Path) -> None:
+    import json
+
+    from training_preflight import run_preflight_checks
+
+    _make_image(tmp_path / "images" / "rain.jpg", color=(10, 20, 30))
+    _make_image(tmp_path / "images" / "sunny.jpg", color=(30, 20, 10))
+    train_csv = tmp_path / "train.csv"
+    train_csv.write_text(
+        "image,label\n"
+        "rain.jpg,rain\n"
+        "sunny.jpg,sunny\n",
+        encoding="utf-8",
+    )
+    class_map = tmp_path / "class_to_idx.json"
+    class_map.write_text(json.dumps({"sunny": 0, "rain": 1}), encoding="utf-8")
+
+    result = run_preflight_checks(
+        config_path=Path("configs/convnext_tiny.yaml"),
+        train_csv=train_csv,
+        image_root=tmp_path / "images",
+        class_map=class_map,
+    )
+
+    assert result["classes"] == ["sunny", "rain"]
+
+
+def test_server_strict_profile_requires_class_map_for_csv(tmp_path: Path) -> None:
+    from training_preflight import run_preflight_checks
+
+    _make_image(tmp_path / "images" / "rain.jpg")
+    train_csv = tmp_path / "train.csv"
+    train_csv.write_text("image,label\nrain.jpg,rain\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="requires data.class_map or --class-map"):
+        run_preflight_checks(
+            config_path=Path("configs/convnext_tiny.yaml"),
+            profile="server-strict",
+            train_csv=train_csv,
+            image_root=tmp_path / "images",
+        )
+
+
+def test_server_strict_profile_enables_high_value_gates(tmp_path: Path) -> None:
+    import json
+
+    from training_preflight import run_preflight_checks
+
+    samples = [
+        ("rain1.jpg", "rain", (10, 20, 30)),
+        ("rain2.jpg", "rain", (11, 20, 30)),
+        ("sunny1.jpg", "sunny", (30, 20, 10)),
+        ("sunny2.jpg", "sunny", (30, 21, 10)),
+    ]
+    for image_name, _label, color in samples:
+        _make_image(tmp_path / "images" / image_name, color=color)
+    train_csv = tmp_path / "train.csv"
+    train_csv.write_text(
+        "image,label\n" + "".join(f"{image_name},{label}\n" for image_name, label, _color in samples),
+        encoding="utf-8",
+    )
+    class_map = tmp_path / "class_to_idx.json"
+    class_map.write_text(json.dumps({"rain": 0, "sunny": 1}), encoding="utf-8")
+
+    result = run_preflight_checks(
+        config_path=Path("configs/convnext_tiny.yaml"),
+        profile="server-strict",
+        train_csv=train_csv,
+        image_root=tmp_path / "images",
+        class_map=class_map,
+    )
+
+    assert result["profile"] == "server-strict"
+    assert result["image_integrity"] == {
+        "checked_exists": True,
+        "checked_readable_images": True,
+        "checked_unique_image_id": True,
+        "checked_unique_realpath": True,
+        "checked_unique_image_hash": True,
+    }
+    assert result["labeled_label_counts"] == {"rain": 2, "sunny": 2}
 
 
 def test_preflight_rejects_labels_outside_expected_classes(tmp_path: Path) -> None:

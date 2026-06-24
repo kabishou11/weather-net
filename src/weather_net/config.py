@@ -104,7 +104,7 @@ def _update_dataclass(instance: Any, values: dict[str, Any]) -> Any:
 def load_config(path: Path | None) -> AppConfig:
     config = AppConfig()
     if path is None:
-        _validate_config(config)
+        validate_config(config)
         return config
     raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     if not isinstance(raw, dict):
@@ -116,16 +116,30 @@ def load_config(path: Path | None) -> AppConfig:
         if not isinstance(section_values, dict):
             raise ValueError(f"Config section must be a mapping: {section_name}")
         _update_dataclass(section, section_values)
-    _validate_config(config)
+    validate_config(config)
     return config
 
 
-def _validate_config(config: AppConfig) -> None:
+def validate_config(config: AppConfig) -> None:
     supported_losses = {"ce", "focal", "class_balanced", "class_balanced_focal", "balanced_softmax", "ldam"}
     if config.train.loss_name not in supported_losses:
         raise ValueError(
             "train.loss_name must be one of: ce, focal, class_balanced, class_balanced_focal, balanced_softmax, ldam"
         )
+    if config.train.epochs <= 0:
+        raise ValueError("train.epochs must be positive")
+    if config.train.batch_size <= 0:
+        raise ValueError("train.batch_size must be positive")
+    if config.data.folds <= 0:
+        raise ValueError("data.folds must be positive")
+    if config.data.num_workers < 0:
+        raise ValueError("data.num_workers must be non-negative")
+    if not 0 < config.data.val_fraction < 1:
+        raise ValueError("data.val_fraction must be in (0, 1)")
+    if config.train.lr <= 0:
+        raise ValueError("train.lr must be positive")
+    if config.train.weight_decay < 0:
+        raise ValueError("train.weight_decay must be non-negative")
     if config.train.focal_gamma < 0:
         raise ValueError("train.focal_gamma must be non-negative")
     if config.train.loss_warmup_epochs < 0:
@@ -159,6 +173,9 @@ def _validate_config(config: AppConfig) -> None:
             raise ValueError("augmix_jsd is intentionally mutually exclusive with MixUp/CutMix")
     if config.infer.batch_size <= 0:
         raise ValueError("infer.batch_size must be positive")
+
+
+_validate_config = validate_config
 
 
 def resolve_device(requested: str = "auto") -> str:

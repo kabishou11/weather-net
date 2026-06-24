@@ -615,35 +615,29 @@ data:
 
 ```bash
 python3 training_preflight.py \
+  --profile server-strict \
   --config configs/convnextv2_384.yaml \
   --train-csv data/train.csv \
   --image-root data/images \
   --class-map outputs/convnextv2_384/class_to_idx.json \
-  --check-image-exists \
-  --check-readable-images \
-  --check-unique-image-id \
-  --check-unique-realpath \
-  --check-unique-image-hash \
   --min-images-per-class 2 \
-  --min-labeled-images-per-class 2 \
   --output outputs/preflight_train.json
 ```
+
+`--profile server-strict` 会自动打开图片存在/可读、`image_id`、真实路径、图片内容 hash 去重、伪标签阈值、外部样本权重和真实标注类支撑等关键门控；CSV 训练必须提供 `--class-map` 或配置 `data.class_map`，确保 preflight 与训练入口使用同一份官方类别映射。
 
 如果训练 CSV 包含 `source=external` 或 `external_*`，必须显式声明规则允许外部公开数据：
 
 ```bash
 python3 training_preflight.py \
+  --profile server-strict \
   --config configs/convnextv2_384.yaml \
   --train-csv data/train_with_external.csv \
   --image-root data/images \
   --class-map outputs/convnextv2_384/class_to_idx.json \
-  --check-image-exists \
-  --check-readable-images \
-  --check-unique-image-hash \
   --allow-external-data \
   --external-max-ratio 0.3 \
-  --external-max-sample-weight 0.5 \
-  --min-labeled-images-per-class 2
+  --external-max-sample-weight 0.5
 ```
 
 外部样本必须在 CSV 中显式提供 `sample_weight`，不要依赖默认 `1.0`。建议第一轮 Road Weather-Time 用 `0.3/0.5` 两档做 A/B，Vijay 用 `0.1-0.2`，WEAPD 用 `0.1` 或只做 embedding guard；同时设置 `--external-max-ratio` 和 `--external-max-sample-weight`，防止外部域样本数量或权重压过官方训练集。
@@ -652,28 +646,25 @@ python3 training_preflight.py \
 
 ```bash
 python3 training_preflight.py \
+  --profile server-strict \
   --config configs/convnextv2_384.yaml \
   --train-csv data/merged_train.csv \
   --image-root data/images \
-  --check-image-exists \
-  --check-readable-images \
-  --check-unique-image-id \
-  --check-unique-realpath \
-  --check-unique-image-hash \
+  --class-map outputs/convnextv2_384/class_to_idx.json \
   --pseudo-min-confidence 0.95 \
-  --pseudo-max-ratio 0.5 \
-  --min-labeled-images-per-class 2
+  --pseudo-max-ratio 0.5
 ```
 
 如果已经有 `infer.py` 生成的 `.stats.json`，可把推理时间也纳入同一个 gate：
 
 ```bash
 python3 training_preflight.py \
+  --profile server-strict \
   --config configs/convnextv2_384.yaml \
   --train-csv data/train.csv \
   --image-root data/images \
+  --class-map outputs/convnextv2_384/class_to_idx.json \
   --inference-stats outputs/submission.stats.json \
-  --max-seconds-per-image 0.05 \
   --max-checkpoints 1
 ```
 
