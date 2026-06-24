@@ -284,6 +284,152 @@ def test_validate_rebalance_grid_writes_baseline_and_candidate_metrics(monkeypat
     assert calls == [Path("fold0.pt"), tmp_path / "fold0_tau0p50.pt", tmp_path / "fold0_crt_sqrt.pt"]
 
 
+def test_summarize_fold_rebalance_grid_selects_cross_fold_winner(tmp_path: Path) -> None:
+    from classifier_rebalance_grid import RebalanceCandidate, summarize_fold_rebalance_grid
+
+    def candidate(fold: int, name: str, method: str, macro_f1: float, fog_f1: float) -> RebalanceCandidate:
+        path = tmp_path / f"fold{fold}_{name}.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "macro_f1": macro_f1,
+                    "per_class_f1": {"fog": fog_f1, "sunny": 0.9},
+                }
+            ),
+            encoding="utf-8",
+        )
+        return RebalanceCandidate(
+            name=name,
+            method=method,
+            checkpoint=Path(f"fold{fold}.pt"),
+            output=Path(f"fold{fold}_{name}.pt"),
+            metrics_json=path,
+        )
+
+    summary = summarize_fold_rebalance_grid(
+        {
+            0: [
+                candidate(0, "baseline", "baseline", 0.70, 0.62),
+                candidate(0, "tau0p50", "tau_norm", 0.73, 0.64),
+                candidate(0, "crt_sqrt", "crt", 0.76, 0.50),
+            ],
+            1: [
+                candidate(1, "baseline", "baseline", 0.72, 0.63),
+                candidate(1, "tau0p50", "tau_norm", 0.75, 0.66),
+                candidate(1, "crt_sqrt", "crt", 0.77, 0.52),
+            ],
+        },
+        min_delta_macro_f1=0.01,
+        min_per_class_f1=0.6,
+        tie_epsilon=0.001,
+    )
+
+    assert summary["fold_count"] == 2
+    assert summary["best_name"] == "tau0p50"
+    assert summary["baseline_mean_macro_f1"] == 0.71
+    results = {item["name"]: item for item in summary["results"]}
+    assert results["tau0p50"]["mean_macro_f1"] == 0.74
+    assert results["tau0p50"]["delta_mean_macro_f1_vs_baseline"] == 0.030000000000000027
+    assert results["crt_sqrt"]["selection_status"] == "rejected_min_per_class_f1"
+
+
+def test_run_all_fold_rebalance_grid_uses_fold_safe_train_and_val(monkeypatch, tmp_path: Path) -> None:
+    import classifier_rebalance_grid
+    from classifier_rebalance_grid import RebalanceCandidate, run_all_fold_rebalance_grid
+
+    summary_path = tmp_path / "fold_safe_rebalance_manifests.json"
+    fold_entries = []
+    for fold in [0, 1]:
+        train_csv = tmp_path / f"fold{fold}_rebalance_train.csv"
+        val_csv = tmp_path / f"fold{fold}_rebalance_val.csv"
+        train_csv.write_text("image,label,source\n", encoding="utf-8")
+        val_csv.write_text("image,label,source\n", encoding="utf-8")
+        fold_entries.append(
+            {
+                "fold": fold,
+                "train_csv": str(train_csv),
+                "val_csv": str(val_csv),
+                "train_rows": 4,
+                "val_rows": 2,
+                "train_source_counts": {"labeled": 4},
+                "val_source_counts": {"labeled": 2},
+                "train_row_digest": f"train-{fold}",
+                "val_row_digest": f"val-{fold}",
+            }
+        )
+    summary_path.write_text(json.dumps({"folds": fold_entries, "fold_count": 2}), encoding="utf-8")
+    calls: list[tuple[str, int, Path, Path]] = []
+
+    monkeypatch.setattr(
+        classifier_rebalance_grid,
+        "_checkpoint_fold_from_path",
+        lambda path: 0 if Path(path).name == "fold0.pt" else 1,
+    )
+
+    def fake_run_rebalance_grid(**kwargs):
+        fold = 0 if Path(kwargs["checkpoint"]).name == "fold0.pt" else 1
+        calls.append(("run", fold, Path(kwargs["train_csv"]), Path(kwargs["output_dir"])))
+        return [
+            RebalanceCandidate(
+                name="tau0p50",
+                method="tau_norm",
+                checkpoint=Path(kwargs["checkpoint"]),
+                output=Path(kwargs["output_dir"]) / f"fold{fold}_tau.pt",
+                tau=0.5,
+            )
+        ]
+
+    def fake_validate_rebalance_grid(**kwargs):
+        checkpoint = Path(kwargs["checkpoint"])
+        fold = 0 if checkpoint.name == "fold0.pt" else 1
+        output_dir = Path(kwargs["output_dir"])
+        calls.append(("validate", fold, Path(kwargs["val_csv"]), output_dir))
+        baseline = RebalanceCandidate(
+            name="baseline",
+            method="baseline",
+            checkpoint=checkpoint,
+            output=checkpoint,
+            metrics_json=output_dir / "baseline_metrics.json",
+        )
+        baseline.metrics_json.write_text(
+            json.dumps({"macro_f1": 0.70 + fold * 0.02, "per_class_f1": {"fog": 0.62, "sunny": 0.8}}),
+            encoding="utf-8",
+        )
+        for candidate_item in kwargs["candidates"]:
+            candidate_item.metrics_json = output_dir / f"{candidate_item.name}_metrics.json"
+            candidate_item.metrics_json.write_text(
+                json.dumps({"macro_f1": 0.74 + fold * 0.02, "per_class_f1": {"fog": 0.65, "sunny": 0.82}}),
+                encoding="utf-8",
+            )
+        return baseline
+
+    monkeypatch.setattr(classifier_rebalance_grid, "run_rebalance_grid", fake_run_rebalance_grid)
+    monkeypatch.setattr(classifier_rebalance_grid, "validate_rebalance_grid", fake_validate_rebalance_grid)
+
+    result = run_all_fold_rebalance_grid(
+        checkpoints=[Path("fold1.pt"), Path("fold0.pt")],
+        rebalance_manifest_summary=summary_path,
+        output_dir=tmp_path / "grid",
+        tau_values=[0.5],
+        crt_sampler_modes=[],
+        lws_sampler_modes=[],
+        run=True,
+        validate=True,
+        image_root=Path("images"),
+        min_delta_macro_f1=0.01,
+        min_per_class_f1=0.6,
+    )
+
+    assert calls == [
+        ("run", 0, tmp_path / "fold0_rebalance_train.csv", tmp_path / "grid" / "fold0"),
+        ("validate", 0, tmp_path / "fold0_rebalance_val.csv", tmp_path / "grid" / "fold0"),
+        ("run", 1, tmp_path / "fold1_rebalance_train.csv", tmp_path / "grid" / "fold1"),
+        ("validate", 1, tmp_path / "fold1_rebalance_val.csv", tmp_path / "grid" / "fold1"),
+    ]
+    assert result["aggregate"]["best_name"] == "tau0p50"
+    assert result["aggregate"]["fold_count"] == 2
+
+
 def test_parse_args_accepts_rebalance_grid_controls(monkeypatch, tmp_path: Path) -> None:
     import sys
 
@@ -333,7 +479,7 @@ def test_parse_args_accepts_rebalance_grid_controls(monkeypatch, tmp_path: Path)
 
     args = parse_args()
 
-    assert args.checkpoint == Path("fold0.pt")
+    assert args.checkpoint == [Path("fold0.pt")]
     assert args.output_dir == tmp_path
     assert args.tau == [0.5, 1.0]
     assert args.crt_sampler_mode == ["sqrt", "class_balanced"]
@@ -478,6 +624,69 @@ def test_validate_cli_args_requires_checkpoint_for_grid_run() -> None:
 
     with pytest.raises(ValueError, match="--checkpoint"):
         validate_cli_args(args)
+
+
+def test_validate_cli_args_requires_all_fold_summary_and_validation() -> None:
+    import argparse
+
+    import pytest
+
+    from classifier_rebalance_grid import validate_cli_args
+
+    args = argparse.Namespace(
+        checkpoint=[Path("fold0.pt"), Path("fold1.pt")],
+        run=True,
+        validate=False,
+        val_dir=None,
+        val_csv=None,
+        baseline_metrics=None,
+        candidate_metrics=None,
+        prepare_folds=False,
+        train_csv=None,
+        train_dir=None,
+        class_map=None,
+        crt_sampler_mode=["sqrt"],
+        lws_sampler_mode=[],
+        rebalance_manifest_summary=Path("fold_safe_rebalance_manifests.json"),
+    )
+
+    with pytest.raises(ValueError, match="requires --validate"):
+        validate_cli_args(args)
+
+    args.validate = True
+    args.rebalance_manifest_summary = None
+    with pytest.raises(ValueError, match="requires --rebalance-manifest-summary"):
+        validate_cli_args(args)
+
+    args.rebalance_manifest_summary = Path("fold_safe_rebalance_manifests.json")
+    args.train_csv = Path("fold0_rebalance_train.csv")
+    with pytest.raises(ValueError, match="per-fold train_csv"):
+        validate_cli_args(args)
+
+
+def test_validate_cli_args_allows_all_fold_validation_without_val_csv() -> None:
+    import argparse
+
+    from classifier_rebalance_grid import validate_cli_args
+
+    args = argparse.Namespace(
+        checkpoint=[Path("fold0.pt"), Path("fold1.pt")],
+        run=True,
+        validate=True,
+        val_dir=None,
+        val_csv=None,
+        baseline_metrics=None,
+        candidate_metrics=None,
+        prepare_folds=False,
+        train_csv=None,
+        train_dir=None,
+        class_map=None,
+        crt_sampler_mode=["sqrt"],
+        lws_sampler_mode=[],
+        rebalance_manifest_summary=Path("fold_safe_rebalance_manifests.json"),
+    )
+
+    validate_cli_args(args)
 
 
 def test_validate_cli_args_rejects_prepare_folds_with_run_or_validate() -> None:

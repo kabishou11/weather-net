@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
+import torch
+
 from classifier_rebalance import rebalance_checkpoint, retrain_classifier_head
 from src.weather_net.data import (
     ManifestRow,
@@ -378,6 +380,250 @@ def write_summary(output_dir: Path, summary: dict[str, object]) -> tuple[Path, P
     return json_path, csv_path
 
 
+def summarize_fold_rebalance_grid(
+    candidates_by_fold: dict[int, Sequence[RebalanceCandidate]],
+    baseline_name: str = "baseline",
+    min_delta_macro_f1: float = 0.0,
+    min_per_class_f1: float = 0.0,
+    tie_epsilon: float = 0.0,
+) -> dict[str, object]:
+    if not candidates_by_fold:
+        raise ValueError("fold rebalance summary requires at least one fold")
+    if not 0 <= min_per_class_f1 <= 1:
+        raise ValueError("min_per_class_f1 must be in [0, 1]")
+    if tie_epsilon < 0:
+        raise ValueError("tie_epsilon must be non-negative")
+
+    fold_ids = sorted(candidates_by_fold)
+    per_name: dict[str, list[dict[str, object]]] = {}
+    baseline_macros: list[float] = []
+    for fold in fold_ids:
+        names_in_fold: set[str] = set()
+        for candidate in candidates_by_fold[fold]:
+            if candidate.metrics_json is None:
+                raise ValueError(f"candidate metrics_json is required: fold {fold} {candidate.name}")
+            metrics = _read_metrics(candidate.metrics_json)
+            per_class = {str(label): float(score) for label, score in metrics.get("per_class_f1", {}).items()}
+            macro_f1 = float(metrics["macro_f1"])
+            item = {
+                "fold": fold,
+                "name": candidate.name,
+                "method": candidate.method,
+                "checkpoint": str(candidate.output),
+                "metrics_json": str(candidate.metrics_json),
+                "macro_f1": macro_f1,
+                "per_class_f1": per_class,
+                "min_per_class_f1": min(per_class.values()) if per_class else 0.0,
+                "tau": candidate.tau,
+                "sampler_mode": candidate.sampler_mode,
+            }
+            per_name.setdefault(candidate.name, []).append(item)
+            names_in_fold.add(candidate.name)
+            if candidate.name == baseline_name:
+                baseline_macros.append(macro_f1)
+        if baseline_name not in names_in_fold:
+            raise ValueError(f"Missing baseline candidate for fold {fold}: {baseline_name}")
+    if len(baseline_macros) != len(fold_ids):
+        raise ValueError("baseline candidate count does not match fold count")
+    incomplete = {name: len(items) for name, items in per_name.items() if len(items) != len(fold_ids)}
+    if incomplete:
+        raise ValueError(f"candidate names are not present in every fold: {incomplete}")
+
+    baseline_mean = sum(baseline_macros) / len(baseline_macros)
+    results: list[dict[str, object]] = []
+    for name, fold_items in sorted(per_name.items()):
+        macros = [float(item["macro_f1"]) for item in fold_items]
+        min_class_scores = [float(item["min_per_class_f1"]) for item in fold_items]
+        mean_macro = sum(macros) / len(macros)
+        min_per_class_across_folds = min(min_class_scores) if min_class_scores else 0.0
+        method = str(fold_items[0]["method"])
+        delta = mean_macro - baseline_mean
+        item = {
+            "name": name,
+            "method": method,
+            "folds": fold_items,
+            "mean_macro_f1": mean_macro,
+            "baseline_mean_macro_f1": baseline_mean,
+            "delta_mean_macro_f1_vs_baseline": delta,
+            "min_per_class_f1_across_folds": min_per_class_across_folds,
+            "checkpoint_by_fold": {str(item["fold"]): item["checkpoint"] for item in fold_items},
+        }
+        if min_per_class_across_folds < min_per_class_f1:
+            item["selection_status"] = "rejected_min_per_class_f1"
+        elif name != baseline_name and delta < min_delta_macro_f1:
+            item["selection_status"] = "rejected_min_delta_macro_f1"
+        else:
+            item["selection_status"] = "candidate"
+        results.append(item)
+    kept = [item for item in results if item["selection_status"] == "candidate"]
+    if not kept:
+        raise ValueError("No fold candidates passed rebalance grid gates")
+    top_score = max(float(item["mean_macro_f1"]) for item in kept)
+    near_top = [item for item in kept if top_score - float(item["mean_macro_f1"]) <= tie_epsilon]
+    best = sorted(
+        near_top,
+        key=lambda item: (
+            0 if item["name"] == baseline_name else 1,
+            -float(item["min_per_class_f1_across_folds"]),
+            str(item["name"]),
+        ),
+    )[0]
+    return {
+        "best_name": best["name"],
+        "best_checkpoint_by_fold": best["checkpoint_by_fold"],
+        "best_mean_macro_f1": best["mean_macro_f1"],
+        "baseline_mean_macro_f1": baseline_mean,
+        "fold_count": len(fold_ids),
+        "folds": fold_ids,
+        "gates": {
+            "min_delta_macro_f1": min_delta_macro_f1,
+            "min_per_class_f1": min_per_class_f1,
+            "tie_epsilon": tie_epsilon,
+        },
+        "results": results,
+    }
+
+
+def _load_fold_manifest_summary(path: Path) -> dict[int, dict[str, object]]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("rebalance manifest summary must be a JSON object")
+    folds = payload.get("folds")
+    if not isinstance(folds, list):
+        raise ValueError("rebalance manifest summary is missing folds")
+    by_fold: dict[int, dict[str, object]] = {}
+    for item in folds:
+        if not isinstance(item, dict):
+            raise ValueError("rebalance manifest fold entries must be objects")
+        fold = int(item.get("fold", -1))
+        if fold < 0:
+            raise ValueError(f"invalid fold entry: {item}")
+        if fold in by_fold:
+            raise ValueError(f"duplicate fold entry in rebalance manifest summary: {fold}")
+        train_csv = item.get("train_csv")
+        val_csv = item.get("val_csv")
+        if not isinstance(train_csv, str) or not train_csv:
+            raise ValueError(f"rebalance manifest fold {fold} is missing train_csv")
+        if not isinstance(val_csv, str) or not val_csv:
+            raise ValueError(f"rebalance manifest fold {fold} is missing val_csv")
+        by_fold[fold] = item
+    return by_fold
+
+
+def _checkpoint_fold_from_path(path: Path, map_location: str = "cpu") -> int:
+    checkpoint = torch.load(path, map_location=map_location)
+    if not isinstance(checkpoint, dict) or "fold" not in checkpoint:
+        raise ValueError(f"checkpoint is missing fold metadata: {path}")
+    try:
+        return int(checkpoint["fold"])
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"checkpoint fold metadata must be an integer: {path}") from error
+
+
+def run_all_fold_rebalance_grid(
+    checkpoints: Sequence[Path],
+    rebalance_manifest_summary: Path,
+    output_dir: Path,
+    tau_values: Sequence[float],
+    crt_sampler_modes: Sequence[str],
+    lws_sampler_modes: Sequence[str] = (),
+    run: bool = False,
+    validate: bool = False,
+    image_root: Path | None = None,
+    epochs: int = 4,
+    batch_size: int = 32,
+    lr: float = 1e-3,
+    device: str = "auto",
+    head_key: str = "auto",
+    head_prefix: str = "auto",
+    val_batch_size: int = 64,
+    min_delta_macro_f1: float = 0.0,
+    min_per_class_f1: float = 0.0,
+    tie_epsilon: float = 0.0,
+) -> dict[str, object]:
+    if not checkpoints:
+        raise ValueError("all-fold rebalance requires at least one checkpoint")
+    fold_manifest = _load_fold_manifest_summary(rebalance_manifest_summary)
+    checkpoint_by_fold: dict[int, Path] = {}
+    for checkpoint in checkpoints:
+        fold = _checkpoint_fold_from_path(checkpoint)
+        if fold in checkpoint_by_fold:
+            raise ValueError(f"duplicate checkpoint for fold {fold}")
+        if fold not in fold_manifest:
+            raise ValueError(f"rebalance manifest summary has no entry for checkpoint fold {fold}")
+        checkpoint_by_fold[fold] = checkpoint
+
+    candidates_by_fold: dict[int, list[RebalanceCandidate]] = {}
+    fold_payloads: list[dict[str, object]] = []
+    for fold in sorted(checkpoint_by_fold):
+        checkpoint = checkpoint_by_fold[fold]
+        manifest = fold_manifest[fold]
+        fold_output_dir = output_dir / f"fold{fold}"
+        fold_output_dir.mkdir(parents=True, exist_ok=True)
+        candidates = run_rebalance_grid(
+            checkpoint=checkpoint,
+            output_dir=fold_output_dir,
+            tau_values=tau_values,
+            crt_sampler_modes=crt_sampler_modes,
+            lws_sampler_modes=lws_sampler_modes,
+            train_csv=Path(str(manifest["train_csv"])),
+            image_root=image_root,
+            run=run,
+            epochs=epochs,
+            batch_size=batch_size,
+            lr=lr,
+            device=device,
+            head_key=head_key,
+            head_prefix=head_prefix,
+            rebalance_manifest_summary=rebalance_manifest_summary,
+        )
+        fold_candidates: list[RebalanceCandidate]
+        if validate:
+            baseline = validate_rebalance_grid(
+                checkpoint=checkpoint,
+                candidates=candidates,
+                output_dir=fold_output_dir,
+                val_csv=Path(str(manifest["val_csv"])),
+                val_image_root=image_root,
+                batch_size=val_batch_size,
+                device=device,
+            )
+            fold_candidates = [baseline, *candidates]
+        else:
+            fold_candidates = candidates
+        candidates_by_fold[fold] = fold_candidates
+        fold_payloads.append(
+            {
+                "fold": fold,
+                "checkpoint": str(checkpoint),
+                "train_csv": str(manifest["train_csv"]),
+                "val_csv": str(manifest["val_csv"]),
+                "output_dir": str(fold_output_dir),
+                "candidates": [
+                    candidate.__dict__ | {
+                        "checkpoint": str(candidate.checkpoint),
+                        "output": str(candidate.output),
+                        "metrics_json": str(candidate.metrics_json) if candidate.metrics_json is not None else None,
+                    }
+                    for candidate in fold_candidates
+                ],
+            }
+        )
+    payload: dict[str, object] = {"folds": fold_payloads}
+    if validate:
+        aggregate = summarize_fold_rebalance_grid(
+            candidates_by_fold,
+            min_delta_macro_f1=min_delta_macro_f1,
+            min_per_class_f1=min_per_class_f1,
+            tie_epsilon=tie_epsilon,
+        )
+        output_dir.mkdir(parents=True, exist_ok=True)
+        json_path = output_dir / "classifier_rebalance_all_folds_summary.json"
+        json_path.write_text(json.dumps(aggregate, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        payload["aggregate"] = {**aggregate, "json": str(json_path)}
+    return payload
+
+
 def run_rebalance_grid(
     checkpoint: Path,
     output_dir: Path,
@@ -490,8 +736,16 @@ def validate_rebalance_grid(
 
 def validate_cli_args(args: argparse.Namespace) -> None:
     prepare_folds = bool(getattr(args, "prepare_folds", False))
-    if not prepare_folds and getattr(args, "checkpoint", None) is None:
+    raw_checkpoint = getattr(args, "checkpoint", None)
+    if raw_checkpoint is None:
+        checkpoints = []
+    elif isinstance(raw_checkpoint, (str, Path)):
+        checkpoints = [Path(raw_checkpoint)]
+    else:
+        checkpoints = list(raw_checkpoint)
+    if not prepare_folds and not checkpoints:
         raise ValueError("--checkpoint is required unless --prepare-folds is set")
+    all_folds = len(checkpoints) > 1
     if prepare_folds:
         mixed_options = (
             bool(getattr(args, "run", False))
@@ -505,10 +759,20 @@ def validate_cli_args(args: argparse.Namespace) -> None:
         )
         if mixed_options:
             raise ValueError("--prepare-folds cannot be combined with grid runtime options")
+    if all_folds and getattr(args, "baseline_metrics", None) is not None:
+        raise ValueError("all-fold rebalance uses automatic validation; do not pass --baseline-metrics")
+    if all_folds and getattr(args, "candidate_metrics", None):
+        raise ValueError("all-fold rebalance uses automatic validation; do not pass --candidate-metrics")
+    if all_folds and getattr(args, "train_csv", None) is not None:
+        raise ValueError("all-fold rebalance reads per-fold train_csv from --rebalance-manifest-summary")
+    if all_folds and not getattr(args, "rebalance_manifest_summary", None):
+        raise ValueError("all-fold rebalance requires --rebalance-manifest-summary")
+    if all_folds and not getattr(args, "validate", False):
+        raise ValueError("all-fold rebalance requires --validate so candidates are selected by cross-fold metrics")
     if args.validate:
         if args.baseline_metrics is not None or args.candidate_metrics:
             raise ValueError("Do not combine --validate with --baseline-metrics or --candidate-metrics")
-        if args.val_dir is None and args.val_csv is None:
+        if not all_folds and args.val_dir is None and args.val_csv is None:
             raise ValueError("--validate requires --val-dir or --val-csv")
     if (
         not prepare_folds
@@ -526,7 +790,7 @@ def validate_cli_args(args: argparse.Namespace) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build and summarize tau/crt classifier rebalance grids.")
-    parser.add_argument("--checkpoint", type=Path, default=None)
+    parser.add_argument("--checkpoint", type=Path, nargs="+", default=None)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--tau", type=float, nargs="*", default=[0.25, 0.5, 0.75, 1.0])
     parser.add_argument("--crt-sampler-mode", nargs="*", default=["sqrt", "class_balanced"])
@@ -574,10 +838,36 @@ def main() -> None:
         )
         print(json.dumps(payload, indent=2, ensure_ascii=False))
         return
-    if args.checkpoint is None:
+    checkpoints = list(args.checkpoint or [])
+    if not checkpoints:
         raise ValueError("--checkpoint is required unless --prepare-folds is set")
+    if len(checkpoints) > 1:
+        payload = run_all_fold_rebalance_grid(
+            checkpoints=checkpoints,
+            rebalance_manifest_summary=args.rebalance_manifest_summary,
+            output_dir=args.output_dir,
+            tau_values=args.tau,
+            crt_sampler_modes=args.crt_sampler_mode,
+            lws_sampler_modes=args.lws_sampler_mode,
+            run=args.run,
+            validate=args.validate,
+            image_root=args.image_root,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            lr=args.lr,
+            device=args.device,
+            head_key=args.head_key,
+            head_prefix=args.head_prefix,
+            val_batch_size=args.val_batch_size,
+            min_delta_macro_f1=args.min_delta_macro_f1,
+            min_per_class_f1=args.min_per_class_f1,
+            tie_epsilon=args.tie_epsilon,
+        )
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        return
+    checkpoint = checkpoints[0]
     candidates = run_rebalance_grid(
-        checkpoint=args.checkpoint,
+        checkpoint=checkpoint,
         output_dir=args.output_dir,
         tau_values=args.tau,
         crt_sampler_modes=args.crt_sampler_mode,
@@ -600,7 +890,7 @@ def main() -> None:
     baseline_metrics = args.baseline_metrics
     if args.validate:
         baseline = validate_rebalance_grid(
-            checkpoint=args.checkpoint,
+            checkpoint=checkpoint,
             candidates=candidates,
             output_dir=args.output_dir,
             val_dir=args.val_dir,
@@ -614,8 +904,8 @@ def main() -> None:
         baseline = RebalanceCandidate(
             name="baseline",
             method="baseline",
-            checkpoint=args.checkpoint,
-            output=args.checkpoint,
+            checkpoint=checkpoint,
+            output=checkpoint,
             metrics_json=baseline_metrics,
         )
         if baseline.metrics_json is None:

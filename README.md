@@ -357,6 +357,32 @@ python3 classifier_rebalance_grid.py \
 
 汇总会输出 `classifier_rebalance_grid_summary.json/csv`，只有 macro F1 达到增益门槛且最低类 F1 不崩的候选才会被选中。这个门控用于避免在小验证集上被单一高分候选骗过去。
 
+5 折 checkpoint 已经训练好后，推荐直接跑 all-fold 模式，用跨 fold 平均 F1 选择候选，减少单 fold 偶然性：
+
+```bash
+python3 classifier_rebalance_grid.py \
+  --checkpoint \
+    outputs/convnextv2_384/convnextv2_tiny.fcmae_ft_in22k_in1k_fold0.pt \
+    outputs/convnextv2_384/convnextv2_tiny.fcmae_ft_in22k_in1k_fold1.pt \
+    outputs/convnextv2_384/convnextv2_tiny.fcmae_ft_in22k_in1k_fold2.pt \
+    outputs/convnextv2_384/convnextv2_tiny.fcmae_ft_in22k_in1k_fold3.pt \
+    outputs/convnextv2_384/convnextv2_tiny.fcmae_ft_in22k_in1k_fold4.pt \
+  --output-dir outputs/convnextv2_384/rebalance_grid/all_folds \
+  --tau 0.25 0.5 0.75 1.0 \
+  --crt-sampler-mode sqrt class_balanced \
+  --lws-sampler-mode sqrt class_balanced \
+  --rebalance-manifest-summary outputs/convnextv2_384/rebalance_grid/fold_safe_manifests/fold_safe_rebalance_manifests.json \
+  --image-root data/images \
+  --run \
+  --validate \
+  --val-batch-size 64 \
+  --min-delta-macro-f1 0.003 \
+  --min-per-class-f1 0.6 \
+  --tie-epsilon 0.001
+```
+
+all-fold 模式会读取每个 checkpoint 内的 `fold` 元数据，自动匹配对应的 `fold{n}_rebalance_train.csv` 和 `fold{n}_rebalance_val.csv`，并输出 `classifier_rebalance_all_folds_summary.json`。只有跨 fold 平均 macro F1 过门槛、且任一 fold 的最低类 F1 不低于阈值的候选才会被选中。
+
 ## 伪标签
 
 对未标注图片生成高置信伪标签：
