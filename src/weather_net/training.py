@@ -347,6 +347,45 @@ def weighted_soft_cross_entropy(
     return losses.sum() / normalizer.sum().clamp_min(1e-8)
 
 
+def split_augmix_jsd_batch(images) -> tuple[torch.Tensor, list[torch.Tensor]]:
+    if isinstance(images, torch.Tensor):
+        return images, []
+    if not isinstance(images, (list, tuple)) or len(images) != 3:
+        raise ValueError("augmix_jsd batches must contain exactly three image views")
+    clean, aug1, aug2 = images
+    if not isinstance(clean, torch.Tensor) or not isinstance(aug1, torch.Tensor) or not isinstance(aug2, torch.Tensor):
+        raise ValueError("augmix_jsd image views must be tensors")
+    if clean.shape != aug1.shape or clean.shape != aug2.shape:
+        raise ValueError("augmix_jsd image views must have matching shapes")
+    return clean, [aug1, aug2]
+
+
+def augmix_jsd_loss(
+    clean_logits: torch.Tensor,
+    aug1_logits: torch.Tensor,
+    aug2_logits: torch.Tensor,
+    sample_weights: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if clean_logits.shape != aug1_logits.shape or clean_logits.shape != aug2_logits.shape:
+        raise ValueError("AugMix JSD logits must have matching shapes")
+    clean_logits = clean_logits.float()
+    aug1_logits = aug1_logits.float()
+    aug2_logits = aug2_logits.float()
+    clean_probs = torch.softmax(clean_logits, dim=1)
+    aug1_probs = torch.softmax(aug1_logits, dim=1)
+    aug2_probs = torch.softmax(aug2_logits, dim=1)
+    mixture_log_probs = ((clean_probs + aug1_probs + aug2_probs) / 3.0).clamp_min(1e-7).detach().log()
+    losses = (
+        torch.nn.functional.kl_div(mixture_log_probs, clean_probs, reduction="none").sum(dim=1)
+        + torch.nn.functional.kl_div(mixture_log_probs, aug1_probs, reduction="none").sum(dim=1)
+        + torch.nn.functional.kl_div(mixture_log_probs, aug2_probs, reduction="none").sum(dim=1)
+    ) / 3.0
+    if sample_weights is None:
+        return losses.mean()
+    sample_weights = sample_weights.to(losses.device, dtype=losses.dtype)
+    return (losses * sample_weights).sum() / sample_weights.sum().clamp_min(1e-8)
+
+
 def train_one_epoch(
     model: nn.Module,
     loader: DataLoader,
@@ -362,6 +401,7 @@ def train_one_epoch(
     focal_gamma: float = 0.0,
     class_weights: torch.Tensor | None = None,
     model_ema: ModelEma | None = None,
+    jsd_weight: float = 0.0,
 ) -> float:
     model.train()
     total_loss = 0.0
@@ -370,12 +410,21 @@ def train_one_epoch(
     class_weights = None if class_weights is None else class_weights.to(device)
     use_focal = loss_name in {"focal", "class_balanced_focal"}
 
+    if jsd_weight < 0:
+        raise ValueError("jsd_weight must be non-negative")
+
     for images, targets, sample_weights in loader:
+        images, augmix_views = split_augmix_jsd_batch(images)
+        if jsd_weight > 0 and not augmix_views:
+            raise ValueError("jsd_weight requires augmix_jsd batches with three image views")
         images = images.to(device, non_blocking=True)
+        augmix_views = [view.to(device, non_blocking=True) for view in augmix_views]
         targets = targets.to(device, non_blocking=True)
         sample_weights = sample_weights.to(device, non_blocking=True)
         optimizer.zero_grad(set_to_none=True)
         with torch.autocast(device_type="cuda", enabled=use_amp):
+            if augmix_views and (mixup_alpha > 0 or cutmix_alpha > 0):
+                raise ValueError("augmix_jsd batches are intentionally mutually exclusive with MixUp/CutMix")
             if mixup_alpha > 0 or cutmix_alpha > 0:
                 images, soft_targets, weighted_targets = apply_batch_augmentations(
                     images,
@@ -406,6 +455,12 @@ def train_one_epoch(
                     class_weights=class_weights,
                     focal_gamma=focal_gamma if use_focal else 0.0,
                 )
+            if augmix_views:
+                if jsd_weight <= 0:
+                    raise ValueError("jsd_weight must be positive for augmix_jsd batches")
+                aug1_logits = model(augmix_views[0])
+                aug2_logits = model(augmix_views[1])
+                loss = loss + (jsd_weight * augmix_jsd_loss(logits, aug1_logits, aug2_logits, sample_weights))
         scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
@@ -654,6 +709,7 @@ def train_config(config: AppConfig, device_request: str = "auto") -> list[Path]:
                 focal_gamma=config.train.focal_gamma,
                 class_weights=class_weights,
                 model_ema=model_ema,
+                jsd_weight=config.train.jsd_weight,
             )
             eval_model = model_ema.module if model_ema is not None else model
             report, val_loss = evaluate(eval_model, val_loader, device=device, class_names=class_names)

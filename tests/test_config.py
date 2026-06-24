@@ -73,6 +73,59 @@ def test_load_config_accepts_inference_amp_option(tmp_path: Path) -> None:
     assert config.infer.amp is True
 
 
+def test_load_config_accepts_augmix_jsd_training_options(tmp_path: Path) -> None:
+    from src.weather_net.config import load_config
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "data:\n"
+        "  augment_policy: augmix_jsd\n"
+        "train:\n"
+        "  jsd_weight: 12.0\n"
+        "  mixup_alpha: 0.0\n"
+        "  cutmix_alpha: 0.0\n",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert config.data.augment_policy == "augmix_jsd"
+    assert config.train.jsd_weight == 12.0
+
+
+def test_load_config_rejects_augmix_jsd_without_consistency_weight(tmp_path: Path) -> None:
+    import pytest
+    from src.weather_net.config import load_config
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "data:\n"
+        "  augment_policy: augmix_jsd\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="jsd_weight"):
+        load_config(config_path)
+
+
+def test_load_config_rejects_augmix_jsd_combined_with_mixup(tmp_path: Path) -> None:
+    import pytest
+    from src.weather_net.config import load_config
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "data:\n"
+        "  augment_policy: augmix_jsd\n"
+        "train:\n"
+        "  jsd_weight: 12.0\n"
+        "  mixup_alpha: 0.2\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="MixUp/CutMix"):
+        load_config(config_path)
+
+
 def test_load_config_rejects_invalid_loss_options(tmp_path: Path) -> None:
     from src.weather_net.config import load_config
 
@@ -117,3 +170,15 @@ def test_convnextv2_384_config_is_parseable() -> None:
     assert config.model.image_size == 384
     assert config.data.folds == 5
     assert config.train.loss_name == "class_balanced_focal"
+
+
+def test_convnextv2_384_augmix_jsd_config_is_parseable() -> None:
+    from src.weather_net.config import load_config
+
+    config = load_config(Path("configs/convnextv2_384_augmix_jsd.yaml"))
+
+    assert config.model.image_size == 384
+    assert config.data.augment_policy == "augmix_jsd"
+    assert config.train.jsd_weight == 12.0
+    assert config.train.mixup_alpha == 0.0
+    assert config.train.cutmix_alpha == 0.0

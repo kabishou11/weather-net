@@ -170,3 +170,160 @@ def test_weighted_soft_cross_entropy_normalizes_embedded_target_weights() -> Non
     loss = weighted_soft_cross_entropy(logits, weighted_targets)
 
     assert torch.isclose(loss, torch.tensor(0.6931472), atol=1e-6)
+
+
+def test_augmix_jsd_loss_is_zero_for_identical_predictions() -> None:
+    from src.weather_net.training import augmix_jsd_loss
+
+    logits = torch.tensor([[3.0, 0.0], [0.0, 3.0]])
+
+    loss = augmix_jsd_loss(logits, logits.clone(), logits.clone())
+
+    assert torch.isclose(loss, torch.tensor(0.0), atol=1e-7)
+
+
+def test_augmix_jsd_loss_is_positive_for_different_predictions() -> None:
+    from src.weather_net.training import augmix_jsd_loss
+
+    clean = torch.tensor([[4.0, 0.0], [0.0, 4.0]])
+    aug1 = torch.tensor([[0.0, 4.0], [0.0, 4.0]])
+    aug2 = torch.tensor([[4.0, 0.0], [4.0, 0.0]])
+
+    loss = augmix_jsd_loss(clean, aug1, aug2)
+
+    assert torch.isfinite(loss)
+    assert loss > 0
+
+
+def test_augmix_jsd_loss_matches_augmix_reference_direction() -> None:
+    from src.weather_net.training import augmix_jsd_loss
+
+    clean = torch.tensor([[3.0, 0.0]])
+    aug1 = torch.tensor([[0.0, 2.0]])
+    aug2 = torch.tensor([[1.0, 1.0]])
+    clean_probs = torch.softmax(clean, dim=1)
+    aug1_probs = torch.softmax(aug1, dim=1)
+    aug2_probs = torch.softmax(aug2, dim=1)
+    mixture_log_probs = ((clean_probs + aug1_probs + aug2_probs) / 3.0).clamp_min(1e-7).log()
+    expected = (
+        torch.nn.functional.kl_div(mixture_log_probs, clean_probs, reduction="batchmean")
+        + torch.nn.functional.kl_div(mixture_log_probs, aug1_probs, reduction="batchmean")
+        + torch.nn.functional.kl_div(mixture_log_probs, aug2_probs, reduction="batchmean")
+    ) / 3.0
+
+    loss = augmix_jsd_loss(clean, aug1, aug2)
+
+    assert torch.isclose(loss, expected, atol=1e-7)
+
+
+def test_augmix_jsd_loss_respects_sample_weights() -> None:
+    from src.weather_net.training import augmix_jsd_loss
+
+    clean = torch.tensor([[4.0, 0.0], [4.0, 0.0]])
+    aug1 = torch.tensor([[0.0, 4.0], [4.0, 0.0]])
+    aug2 = torch.tensor([[0.0, 4.0], [4.0, 0.0]])
+
+    unweighted = augmix_jsd_loss(clean, aug1, aug2)
+    weighted = augmix_jsd_loss(clean, aug1, aug2, sample_weights=torch.tensor([0.1, 1.0]))
+
+    assert weighted < unweighted
+
+
+def test_split_augmix_jsd_batch_unpacks_three_views() -> None:
+    from src.weather_net.training import split_augmix_jsd_batch
+
+    clean = torch.zeros(2, 3, 4, 4)
+    aug1 = torch.ones(2, 3, 4, 4)
+    aug2 = torch.full((2, 3, 4, 4), 2.0)
+
+    base, extra_views = split_augmix_jsd_batch([clean, aug1, aug2])
+
+    assert torch.equal(base, clean)
+    assert len(extra_views) == 2
+    assert torch.equal(extra_views[0], aug1)
+    assert torch.equal(extra_views[1], aug2)
+
+
+def test_train_one_epoch_consumes_augmix_jsd_batches() -> None:
+    from torch import nn
+    from torch.utils.data import DataLoader, Dataset
+
+    from src.weather_net.training import train_one_epoch
+
+    clean = torch.randn(4, 3, 4, 4)
+    aug1 = clean + 0.05
+    aug2 = clean - 0.05
+    targets = torch.tensor([0, 1, 0, 1])
+    sample_weights = torch.ones(4)
+
+    class ThreeViewDataset(Dataset):
+        def __len__(self) -> int:
+            return len(targets)
+
+        def __getitem__(self, index: int):
+            return (clean[index], aug1[index], aug2[index]), targets[index], sample_weights[index]
+
+    loader = DataLoader(ThreeViewDataset(), batch_size=2)
+
+    class TinyClassifier(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.net = nn.Sequential(nn.Flatten(), nn.Linear(3 * 4 * 4, 2))
+
+        def forward(self, images: torch.Tensor) -> torch.Tensor:
+            return self.net(images)
+
+    model = TinyClassifier()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    scaler = torch.amp.GradScaler("cuda", enabled=False)
+
+    loss = train_one_epoch(
+        model,
+        loader,
+        optimizer,
+        scaler,
+        device="cpu",
+        num_classes=2,
+        label_smoothing=0.0,
+        mixup_alpha=0.0,
+        cutmix_alpha=0.0,
+        amp=False,
+        jsd_weight=1.0,
+    )
+
+    assert loss > 0
+
+
+def test_train_one_epoch_rejects_jsd_weight_for_single_view_batches() -> None:
+    import pytest
+    from torch import nn
+    from torch.utils.data import DataLoader, TensorDataset
+
+    from src.weather_net.training import train_one_epoch
+
+    loader = DataLoader(
+        TensorDataset(
+            torch.randn(2, 3, 4, 4),
+            torch.tensor([0, 1]),
+            torch.ones(2),
+        ),
+        batch_size=2,
+    )
+    model = nn.Sequential(nn.Flatten(), nn.Linear(3 * 4 * 4, 2))
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    scaler = torch.amp.GradScaler("cuda", enabled=False)
+
+    with pytest.raises(ValueError, match="augmix_jsd"):
+        train_one_epoch(
+            model,
+            loader,
+            optimizer,
+            scaler,
+            device="cpu",
+            num_classes=2,
+            label_smoothing=0.0,
+            mixup_alpha=0.0,
+            cutmix_alpha=0.0,
+            amp=False,
+            jsd_weight=1.0,
+        )

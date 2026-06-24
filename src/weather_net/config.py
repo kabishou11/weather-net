@@ -46,6 +46,7 @@ class TrainConfig:
     amp: bool = True
     mixup_alpha: float = 0.2
     cutmix_alpha: float = 0.0
+    jsd_weight: float = 0.0
     ema_decay: float = 0.0
     output_dir: Path = Path("outputs")
 
@@ -122,6 +123,13 @@ def _validate_config(config: AppConfig) -> None:
         raise ValueError("train.label_smoothing must be in [0, 1)")
     if config.train.mixup_alpha < 0 or config.train.cutmix_alpha < 0:
         raise ValueError("train.mixup_alpha and train.cutmix_alpha must be non-negative")
+    if config.train.jsd_weight < 0:
+        raise ValueError("train.jsd_weight must be non-negative")
+    if config.data.augment_policy == "augmix_jsd":
+        if config.train.jsd_weight <= 0:
+            raise ValueError("train.jsd_weight must be positive when data.augment_policy is augmix_jsd")
+        if config.train.mixup_alpha > 0 or config.train.cutmix_alpha > 0:
+            raise ValueError("augmix_jsd is intentionally mutually exclusive with MixUp/CutMix")
     if config.infer.batch_size <= 0:
         raise ValueError("infer.batch_size must be positive")
 

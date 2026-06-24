@@ -112,9 +112,22 @@ class WeatherAugMixPIL:
         return image.filter(ImageFilter.GaussianBlur(radius=random.uniform(0.2, 1.1)))
 
 
+class ThreeViewTransform:
+    def __init__(self, clean_transform: Callable, aug_transform: Callable) -> None:
+        self.clean_transform = clean_transform
+        self.aug_transform = aug_transform
+
+    def __call__(self, image: Image.Image) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return (
+            self.clean_transform(image),
+            self.aug_transform(image),
+            self.aug_transform(image),
+        )
+
+
 def _validate_transform_options(policy: str, backend: str) -> None:
-    if policy not in {"standard", "weather_augmix", "heavy"}:
-        raise ValueError("policy must be one of: standard, weather_augmix, heavy")
+    if policy not in {"standard", "weather_augmix", "heavy", "augmix_jsd"}:
+        raise ValueError("policy must be one of: standard, weather_augmix, heavy, augmix_jsd")
     if backend not in {"auto", "albumentations", "torchvision"}:
         raise ValueError("backend must be one of: auto, albumentations, torchvision")
 
@@ -222,6 +235,46 @@ def build_transforms(
     backend: str = "auto",
 ) -> Callable:
     _validate_transform_options(policy, backend)
+    if policy == "augmix_jsd":
+        if not train:
+            policy = "standard"
+        elif backend == "torchvision":
+            return ThreeViewTransform(
+                clean_transform=_build_torchvision_transforms(image_size=image_size, train=True, policy="standard"),
+                aug_transform=_build_torchvision_transforms(image_size=image_size, train=True, policy="weather_augmix"),
+            )
+        elif backend == "albumentations":
+            return ThreeViewTransform(
+                clean_transform=_build_albumentations_transforms(image_size=image_size, train=True, policy="standard"),
+                aug_transform=_build_albumentations_transforms(image_size=image_size, train=True, policy="weather_augmix"),
+            )
+        else:
+            try:
+                return ThreeViewTransform(
+                    clean_transform=_build_albumentations_transforms(
+                        image_size=image_size,
+                        train=True,
+                        policy="standard",
+                    ),
+                    aug_transform=_build_albumentations_transforms(
+                        image_size=image_size,
+                        train=True,
+                        policy="weather_augmix",
+                    ),
+                )
+            except ImportError:
+                return ThreeViewTransform(
+                    clean_transform=_build_torchvision_transforms(
+                        image_size=image_size,
+                        train=True,
+                        policy="standard",
+                    ),
+                    aug_transform=_build_torchvision_transforms(
+                        image_size=image_size,
+                        train=True,
+                        policy="weather_augmix",
+                    ),
+                )
     if backend == "torchvision":
         return _build_torchvision_transforms(image_size=image_size, train=train, policy=policy)
     if backend == "albumentations":

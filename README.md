@@ -57,12 +57,24 @@ python3 train.py \
 
 `convnextv2_384.yaml` 面向 24G 4090 设计，主线是 ConvNeXtV2 预训练骨干、384 输入、WeatherAugMix、EMA、MixUp/CutMix，以及 `class_balanced_focal` 长尾损失。这个组合对齐 macro F1：少数天气类会获得更高训练权重，focal 项会让模型更关注难样本。不要只看单次验证分数，最终以 5-fold OOF macro F1、每类 F1 和混淆矩阵判断是否保留。
 
+鲁棒性增强路线：
+
+```bash
+python3 train.py \
+  --train-csv data/train.csv \
+  --image-root data/images \
+  --config configs/convnextv2_384_augmix_jsd.yaml
+```
+
+`convnextv2_384_augmix_jsd.yaml` 使用 `augment_policy: augmix_jsd`：每张训练图生成 clean/aug1/aug2 三视图，监督 loss 仍使用 `class_balanced_focal` 和样本权重，额外加入 AugMix 风格 JSD consistency loss。它针对雨雾、低照、眩光、压缩噪声等分布偏移，训练约增加到 3 路前向成本，但导出的 checkpoint 和普通模型一样，推理不增加耗时。该策略和 MixUp/CutMix 互斥，避免把混合样本分布拿去做一致性约束。
+
 ## 训练预算
 
 单卡 24G RTX 4090 足够跑本工程的主路线。经验估算：
 
 - `convnext_tiny` 224 输入、batch 32：每 1 万张图、10 epoch，约 20-60 分钟；3 折约 1-3 小时，5 折约 2-5 小时。
 - `convnextv2_384` 384 输入、batch 24：每 1 万张图、18 epoch，约 1.5-4 小时；5 折约 8-20 小时。
+- `convnextv2_384_augmix_jsd` 384 输入、batch 16：每 1 万张图、18 epoch，约 3-9 小时；5 折约 15-45 小时。若时间紧，先跑 3 折或只对最佳 fold/seed 做对照。
 - `efficientnet_b0` 快速兜底：每 1 万张图、8 epoch，约 10-30 分钟，适合提交前压推理时间。
 
 如果显存紧张，优先把 `batch_size` 下调到 16 或 12，保持 384 输入和预训练骨干；如果训练时间紧，优先跑 3 折 OOF，再用最佳配置补 5 折。推理默认使用 fp32 以保持概率和伪标签阈值稳定；确认本地/线上 F1 不受影响后，可在配置中设置 `infer.amp: true` 或命令行加 `--amp` 换取速度。
