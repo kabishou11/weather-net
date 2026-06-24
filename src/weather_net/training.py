@@ -96,7 +96,7 @@ def make_sampler(
         if min(weights) == max(weights):
             return None
         return WeightedRandomSampler(weights=weights, num_samples=len(weights), replacement=True)
-    if sampler_mode == "auto" and ("class_balanced" in loss_name or loss_name == "balanced_softmax"):
+    if sampler_mode == "auto" and ("class_balanced" in loss_name or loss_name in {"balanced_softmax", "ldam"}):
         return None
     labels = _labels(rows)
     counts = np.bincount(labels)
@@ -320,8 +320,8 @@ def compute_class_weights(
     loss_name: str,
     beta: float = 0.999,
 ) -> torch.Tensor | None:
-    if loss_name not in {"ce", "focal", "class_balanced", "class_balanced_focal", "balanced_softmax"}:
-        raise ValueError("loss_name must be one of: ce, focal, class_balanced, class_balanced_focal, balanced_softmax")
+    if loss_name not in {"ce", "focal", "class_balanced", "class_balanced_focal", "balanced_softmax", "ldam"}:
+        raise ValueError("loss_name must be one of: ce, focal, class_balanced, class_balanced_focal, balanced_softmax, ldam")
     if "class_balanced" not in loss_name:
         return None
     if not 0 <= beta < 1:
@@ -336,6 +336,18 @@ def compute_class_weights(
 def compute_class_counts(labels: Sequence[int], num_classes: int) -> torch.Tensor:
     counts = torch.bincount(torch.tensor(labels, dtype=torch.long), minlength=num_classes).float()
     return counts.clamp_min(1.0)
+
+
+def compute_ldam_margins(
+    labels: Sequence[int],
+    num_classes: int,
+    max_margin: float = 0.5,
+) -> torch.Tensor:
+    if max_margin <= 0:
+        raise ValueError("ldam_max_margin must be positive")
+    counts = compute_class_counts(labels, num_classes=num_classes)
+    margins = 1.0 / torch.sqrt(torch.sqrt(counts))
+    return margins * (float(max_margin) / margins.max().clamp_min(1e-12))
 
 
 def weighted_soft_cross_entropy(
@@ -388,6 +400,35 @@ def balanced_softmax_cross_entropy(
         sample_weights=sample_weights,
         class_weights=None,
         focal_gamma=focal_gamma,
+        reduction=reduction,
+    )
+
+
+def ldam_cross_entropy(
+    logits: torch.Tensor,
+    soft_targets: torch.Tensor,
+    margins: torch.Tensor,
+    sample_weights: torch.Tensor | None = None,
+    margin_targets: torch.Tensor | None = None,
+    scale: float = 30.0,
+    reduction: str = "mean",
+) -> torch.Tensor:
+    if scale <= 0:
+        raise ValueError("ldam_scale must be positive")
+    if margins.ndim != 1 or margins.numel() != logits.shape[1]:
+        raise ValueError("margins must be a 1D tensor with one value per class")
+    margins = margins.to(logits.device, dtype=logits.dtype)
+    if margin_targets is None:
+        margin_targets = soft_targets
+    margin_targets = margin_targets.to(logits.device, dtype=logits.dtype)
+    margin_per_sample = margin_targets * margins.unsqueeze(0)
+    adjusted_logits = (logits - margin_per_sample) * float(scale)
+    return weighted_soft_cross_entropy(
+        adjusted_logits,
+        soft_targets,
+        sample_weights=sample_weights,
+        class_weights=None,
+        focal_gamma=0.0,
         reduction=reduction,
     )
 
@@ -446,6 +487,8 @@ def train_one_epoch(
     focal_gamma: float = 0.0,
     class_weights: torch.Tensor | None = None,
     class_counts: torch.Tensor | None = None,
+    ldam_margins: torch.Tensor | None = None,
+    ldam_scale: float = 30.0,
     model_ema: ModelEma | None = None,
     jsd_weight: float = 0.0,
 ) -> float:
@@ -455,13 +498,17 @@ def train_one_epoch(
     use_amp = amp and device == "cuda"
     class_weights = None if class_weights is None else class_weights.to(device)
     class_counts = None if class_counts is None else class_counts.to(device)
+    ldam_margins = None if ldam_margins is None else ldam_margins.to(device)
     use_focal = loss_name in {"focal", "class_balanced_focal"}
     use_balanced_softmax = loss_name == "balanced_softmax"
+    use_ldam = loss_name == "ldam"
 
     if jsd_weight < 0:
         raise ValueError("jsd_weight must be non-negative")
     if use_balanced_softmax and class_counts is None:
         raise ValueError("class_counts is required when loss_name is balanced_softmax")
+    if use_ldam and ldam_margins is None:
+        raise ValueError("ldam_margins is required when loss_name is ldam")
 
     for images, targets, sample_weights in loader:
         images, augmix_views = split_augmix_jsd_batch(images)
@@ -496,6 +543,16 @@ def train_one_epoch(
                         sample_weights=None,
                         focal_gamma=0.0,
                     )
+                elif use_ldam:
+                    assert ldam_margins is not None
+                    loss = ldam_cross_entropy(
+                        logits,
+                        weighted_targets,
+                        margins=ldam_margins,
+                        sample_weights=None,
+                        margin_targets=soft_targets,
+                        scale=ldam_scale,
+                    )
                 else:
                     loss = weighted_soft_cross_entropy(
                         logits,
@@ -516,6 +573,15 @@ def train_one_epoch(
                         class_counts=class_counts,
                         sample_weights=sample_weights,
                         focal_gamma=0.0,
+                    )
+                elif use_ldam:
+                    assert ldam_margins is not None
+                    loss = ldam_cross_entropy(
+                        logits,
+                        soft_targets,
+                        margins=ldam_margins,
+                        sample_weights=sample_weights,
+                        scale=ldam_scale,
                     )
                 else:
                     loss = weighted_soft_cross_entropy(
@@ -752,6 +818,15 @@ def train_config(config: AppConfig, device_request: str = "auto") -> list[Path]:
             if config.train.loss_name == "balanced_softmax"
             else None
         )
+        ldam_margins = (
+            compute_ldam_margins(
+                _labels(train_rows),
+                num_classes=len(class_names),
+                max_margin=config.train.ldam_max_margin,
+            )
+            if config.train.loss_name == "ldam"
+            else None
+        )
         optimizer = torch.optim.AdamW(
             model.parameters(),
             lr=config.train.lr,
@@ -785,6 +860,8 @@ def train_config(config: AppConfig, device_request: str = "auto") -> list[Path]:
                 focal_gamma=config.train.focal_gamma,
                 class_weights=class_weights,
                 class_counts=class_counts,
+                ldam_margins=ldam_margins,
+                ldam_scale=config.train.ldam_scale,
                 model_ema=model_ema,
                 jsd_weight=config.train.jsd_weight,
             )

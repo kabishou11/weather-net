@@ -19,6 +19,7 @@
 - Focal Loss：参考 Lin et al., "Focal Loss for Dense Object Detection"，用于降低易分类样本权重，让训练更关注难样本。
 - Class-Balanced Loss：参考 Cui et al., "Class-Balanced Loss Based on Effective Number of Samples"，用于按类别有效样本数调整训练权重，服务 macro F1 和长尾天气类。
 - Balanced Softmax / Logit Adjustment：参考 Ren et al., "Balanced Meta-Softmax for Long-Tailed Visual Recognition" 与 Menon et al., "Long-tail learning via logit adjustment"，本项目实现可选 `balanced_softmax` loss，按训练 fold 的类别计数修正 logits，不复制论文或第三方代码。
+- LDAM：参考 Cao et al., "Learning Imbalanced Datasets with Label-Distribution-Aware Margin Loss"，本项目实现可选 `ldam` loss，按训练 fold 类别计数给少数类更大分类 margin，不改变线上推理结构。
 - ConvNeXt V2：参考 Woo et al., "ConvNeXt V2: Co-designing and Scaling ConvNets with Masked Autoencoders"，通过 `timm` 使用公开预训练骨干，不复制论文或第三方实现代码。
 - Model Soups：参考 Wortsman et al., "Model soups: averaging weights of multiple fine-tuned models improves accuracy without increasing inference time"，本项目增加 OOF-gated greedy 权重搜索，只对同架构 checkpoint 做参数平均。
 - Bootstrap resampling：参考 Efron 的 bootstrap 重采样思想，用于 OOF 决策参数稳定性评估；本项目只用它过滤不稳定的 per-class bias，不引入额外训练数据。

@@ -42,6 +42,8 @@ class TrainConfig:
     loss_name: str = "ce"
     focal_gamma: float = 0.0
     class_balanced_beta: float = 0.999
+    ldam_max_margin: float = 0.5
+    ldam_scale: float = 30.0
     sampler_mode: str = "auto"
     sample_weight_usage: str = "loss"
     amp: bool = True
@@ -112,15 +114,19 @@ def load_config(path: Path | None) -> AppConfig:
 
 
 def _validate_config(config: AppConfig) -> None:
-    supported_losses = {"ce", "focal", "class_balanced", "class_balanced_focal", "balanced_softmax"}
+    supported_losses = {"ce", "focal", "class_balanced", "class_balanced_focal", "balanced_softmax", "ldam"}
     if config.train.loss_name not in supported_losses:
         raise ValueError(
-            "train.loss_name must be one of: ce, focal, class_balanced, class_balanced_focal, balanced_softmax"
+            "train.loss_name must be one of: ce, focal, class_balanced, class_balanced_focal, balanced_softmax, ldam"
         )
     if config.train.focal_gamma < 0:
         raise ValueError("train.focal_gamma must be non-negative")
     if not 0 <= config.train.class_balanced_beta < 1:
         raise ValueError("train.class_balanced_beta must be in [0, 1)")
+    if config.train.ldam_max_margin <= 0:
+        raise ValueError("train.ldam_max_margin must be positive")
+    if config.train.ldam_scale <= 0:
+        raise ValueError("train.ldam_scale must be positive")
     if config.train.sampler_mode not in {"auto", "none", "weighted", "sample_weighted"}:
         raise ValueError("train.sampler_mode must be one of: auto, none, weighted, sample_weighted")
     if config.train.sample_weight_usage not in {"loss", "sampler", "both"}:

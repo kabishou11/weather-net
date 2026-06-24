@@ -103,6 +103,25 @@ def test_load_config_accepts_balanced_softmax_loss(tmp_path: Path) -> None:
     assert config.train.loss_name == "balanced_softmax"
 
 
+def test_load_config_accepts_ldam_loss_options(tmp_path: Path) -> None:
+    from src.weather_net.config import load_config
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "train:\n"
+        "  loss_name: ldam\n"
+        "  ldam_max_margin: 0.4\n"
+        "  ldam_scale: 20.0\n",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert config.train.loss_name == "ldam"
+    assert config.train.ldam_max_margin == 0.4
+    assert config.train.ldam_scale == 20.0
+
+
 def test_load_config_accepts_inference_amp_option(tmp_path: Path) -> None:
     from src.weather_net.config import load_config
 
@@ -207,6 +226,25 @@ def test_load_config_rejects_invalid_class_balanced_beta(tmp_path: Path) -> None
         raise AssertionError("invalid class_balanced_beta should fail during config load")
 
 
+def test_load_config_rejects_invalid_ldam_options(tmp_path: Path) -> None:
+    from src.weather_net.config import load_config
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "train:\n"
+        "  loss_name: ldam\n"
+        "  ldam_max_margin: 0.0\n",
+        encoding="utf-8",
+    )
+
+    try:
+        load_config(config_path)
+    except ValueError as error:
+        assert "ldam_max_margin" in str(error)
+    else:
+        raise AssertionError("invalid ldam_max_margin should fail during config load")
+
+
 def test_convnextv2_384_config_is_parseable() -> None:
     from src.weather_net.config import load_config
 
@@ -227,6 +265,18 @@ def test_convnextv2_384_balanced_softmax_config_is_parseable() -> None:
     assert config.train.loss_name == "balanced_softmax"
     assert config.train.sampler_mode == "auto"
     assert config.train.focal_gamma == 0.0
+
+
+def test_convnextv2_384_ldam_config_is_parseable() -> None:
+    from src.weather_net.config import load_config
+
+    config = load_config(Path("configs/convnextv2_384_ldam.yaml"))
+
+    assert config.model.image_size == 384
+    assert config.data.folds == 5
+    assert config.train.loss_name == "ldam"
+    assert config.train.ldam_max_margin == 0.5
+    assert config.train.ldam_scale == 30.0
 
 
 def test_convnextv2_384_augmix_jsd_config_is_parseable() -> None:

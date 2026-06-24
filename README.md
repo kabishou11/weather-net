@@ -68,6 +68,17 @@ python3 train.py \
 
 `convnextv2_384_balanced_softmax.yaml` 使用 Balanced Softmax，在训练 loss 内按当前 fold 的训练集类别计数调整 logits。它适合天气类别明显不均衡、线上评分看 macro F1 的场景；默认 `sampler_mode: auto` 不再额外做类均衡采样，避免“先验校正 + 重采样”双重放大尾类。建议先跑 1 fold 或 3 fold 和 `class_balanced_focal` 对比，若少数类 F1 上升且大类 precision 没崩，再进入 5 fold/soup。
 
+长尾 margin 对照：
+
+```bash
+python3 train.py \
+  --train-csv data/train.csv \
+  --image-root data/images \
+  --config configs/convnextv2_384_ldam.yaml
+```
+
+`convnextv2_384_ldam.yaml` 使用 LDAM loss，根据当前 fold 的训练集类别计数给少数类更大的分类 margin。它适合“少数天气类召回不足、但模型已经能学到可分特征”的阶段，推理成本为零。LDAM 默认不叠加 class-balanced 权重或自动类均衡采样，避免同时改 loss margin 和样本分布；建议和 Balanced Softmax 做平行 A/B，而不是把两者混合到同一次训练。
+
 鲁棒性增强路线：
 
 ```bash
