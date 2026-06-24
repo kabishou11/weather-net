@@ -2,12 +2,22 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
 from classifier_rebalance import rebalance_checkpoint, retrain_classifier_head
+from src.weather_net.data import (
+    ManifestRow,
+    build_manifest_from_csv,
+    build_manifest_from_image_folder,
+    idx_to_class,
+    is_validation_source,
+    iter_kfold_splits,
+    load_class_mapping,
+)
 from validate import validate_checkpoint
 
 
@@ -22,6 +32,19 @@ class RebalanceCandidate:
     metrics_json: Path | None = None
 
 
+@dataclass(frozen=True)
+class FoldSafeManifest:
+    fold: int
+    train_csv: Path
+    val_csv: Path
+    train_rows: int
+    val_rows: int
+    train_source_counts: dict[str, int]
+    val_source_counts: dict[str, int]
+    train_row_digest: str
+    val_row_digest: str
+
+
 def _tau_name(value: float) -> str:
     return f"tau{value:.2f}".replace(".", "p")
 
@@ -33,6 +56,166 @@ def _validate_unique_candidates(candidates: Sequence[RebalanceCandidate]) -> Non
         raise ValueError("duplicate rebalance candidate names generated")
     if len(set(outputs)) != len(outputs):
         raise ValueError("duplicate rebalance candidate outputs generated")
+
+
+def _source_counts(rows: Sequence[ManifestRow]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for row in rows:
+        counts[row.source] = counts.get(row.source, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def _row_id(row: ManifestRow) -> str:
+    return row.image_id or str(row.path)
+
+
+def _row_digest(rows: Sequence[ManifestRow]) -> str:
+    payload = [
+        {
+            "image": _row_id(row),
+            "label": row.label_name,
+            "source": row.source,
+            "confidence": float(row.confidence),
+            "sample_weight": float(row.sample_weight),
+        }
+        for row in rows
+    ]
+    encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _write_manifest_rows_csv(path: Path, rows: Sequence[ManifestRow], class_names: Sequence[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    include_teacher = any(row.teacher_probs is not None for row in rows)
+    fieldnames = ["image", "label", "source", "confidence", "sample_weight"]
+    if include_teacher:
+        fieldnames.extend(f"teacher_{class_name}" for class_name in class_names)
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(fieldnames)
+        for row in rows:
+            if row.label_name is None:
+                raise ValueError(f"manifest row is missing label_name: {row.path}")
+            image = row.image_id or str(row.path)
+            values = [
+                image,
+                row.label_name,
+                row.source,
+                f"{float(row.confidence):.6f}",
+                f"{float(row.sample_weight):.6f}",
+            ]
+            if include_teacher:
+                if row.teacher_probs is None or len(row.teacher_probs) != len(class_names):
+                    raise ValueError("all rows must have teacher probabilities when teacher columns are written")
+                values.extend(f"{float(value):.8f}" for value in row.teacher_probs)
+            writer.writerow(values)
+
+
+def load_rebalance_manifest(
+    train_csv: Path | None,
+    train_dir: Path | None,
+    image_root: Path | None = None,
+    class_map: Path | None = None,
+) -> tuple[list[ManifestRow], dict[str, int]]:
+    class_to_idx = load_class_mapping(class_map) if class_map is not None else None
+    if train_csv is not None and train_dir is not None:
+        raise ValueError("Use only one of --train-csv or --train-dir")
+    if train_csv is not None:
+        if class_to_idx is None:
+            raise ValueError("fold-safe rebalance requires --class-map for CSV input")
+        return build_manifest_from_csv(train_csv, image_root=image_root, class_to_idx=class_to_idx)
+    if train_dir is not None:
+        return build_manifest_from_image_folder(train_dir, class_to_idx=class_to_idx)
+    raise ValueError("Set --train-csv or --train-dir")
+
+
+def build_fold_safe_rebalance_manifests(
+    train_csv: Path | None,
+    train_dir: Path | None,
+    image_root: Path | None,
+    class_map: Path | None,
+    output_dir: Path,
+    folds: int,
+    seed: int,
+) -> dict[str, object]:
+    if folds < 2:
+        raise ValueError("fold-safe rebalance requires at least 2 folds")
+    rows, class_to_idx = load_rebalance_manifest(
+        train_csv=train_csv,
+        train_dir=train_dir,
+        image_root=image_root,
+        class_map=class_map,
+    )
+    excluded_rows = [row for row in rows if not is_validation_source(row)]
+    labeled_rows = [row for row in rows if is_validation_source(row)]
+    if not labeled_rows:
+        raise ValueError("fold-safe rebalance requires labeled rows")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    class_names = idx_to_class(class_to_idx)
+    manifests: list[FoldSafeManifest] = []
+    for fold, train_rows, val_rows in iter_kfold_splits(labeled_rows, folds=folds, seed=seed):
+        leaked_val_sources = sorted({row.source for row in val_rows if not is_validation_source(row)})
+        if leaked_val_sources:
+            raise ValueError(f"validation fold contains non-labeled sources: {leaked_val_sources}")
+        leaked_train_sources = sorted({row.source for row in train_rows if not is_validation_source(row)})
+        if leaked_train_sources:
+            raise ValueError(f"rebalance train fold contains non-labeled sources: {leaked_train_sources}")
+        val_ids = {_row_id(row) for row in val_rows}
+        leaked_train_ids = [
+            _row_id(row)
+            for row in train_rows
+            if _row_id(row) in val_ids
+        ]
+        if leaked_train_ids:
+            raise ValueError(f"fold train rows overlap validation rows: {leaked_train_ids[:5]}")
+        val_paths = {str(row.path.resolve()) for row in val_rows}
+        leaked_train_paths = [str(row.path.resolve()) for row in train_rows if str(row.path.resolve()) in val_paths]
+        if leaked_train_paths:
+            raise ValueError(f"fold train paths overlap validation paths: {leaked_train_paths[:5]}")
+        train_path = output_dir / f"fold{fold}_rebalance_train.csv"
+        val_path = output_dir / f"fold{fold}_rebalance_val.csv"
+        _write_manifest_rows_csv(train_path, train_rows, class_names=class_names)
+        _write_manifest_rows_csv(val_path, val_rows, class_names=class_names)
+        manifests.append(
+            FoldSafeManifest(
+                fold=fold,
+                train_csv=train_path,
+                val_csv=val_path,
+                train_rows=len(train_rows),
+                val_rows=len(val_rows),
+                train_source_counts=_source_counts(train_rows),
+                val_source_counts=_source_counts(val_rows),
+                train_row_digest=_row_digest(train_rows),
+                val_row_digest=_row_digest(val_rows),
+            )
+        )
+    summary = {
+        "folds": [
+            {
+                "fold": item.fold,
+                "train_csv": str(item.train_csv.resolve()),
+                "val_csv": str(item.val_csv.resolve()),
+                "train_rows": item.train_rows,
+                "val_rows": item.val_rows,
+                "train_source_counts": item.train_source_counts,
+                "val_source_counts": item.val_source_counts,
+                "train_row_digest": item.train_row_digest,
+                "val_row_digest": item.val_row_digest,
+            }
+            for item in manifests
+        ],
+        "class_names": class_names,
+        "source_counts": _source_counts(rows),
+        "image_root": str(image_root) if image_root is not None else (str(train_dir) if train_dir is not None else None),
+        "excluded_source_counts": _source_counts(excluded_rows),
+        "excluded_rows": len(excluded_rows),
+        "labeled_rows": len(labeled_rows),
+        "labeled_row_digest": _row_digest(labeled_rows),
+        "fold_count": len(manifests),
+    }
+    summary_path = output_dir / "fold_safe_rebalance_manifests.json"
+    summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    return {**summary, "summary_json": str(summary_path)}
 
 
 def build_rebalance_grid(
@@ -211,10 +394,13 @@ def run_rebalance_grid(
     device: str = "auto",
     head_key: str = "auto",
     head_prefix: str = "auto",
+    rebalance_manifest_summary: Path | None = None,
 ) -> list[RebalanceCandidate]:
     candidates = build_rebalance_grid(checkpoint, output_dir, tau_values, crt_sampler_modes, lws_sampler_modes)
     if not run:
         return candidates
+    if any(candidate.method in {"crt", "lws"} for candidate in candidates) and rebalance_manifest_summary is None:
+        raise ValueError("--run with cRT/LWS requires --rebalance-manifest-summary from --prepare-folds")
     for candidate in candidates:
         if candidate.method == "tau_norm":
             assert candidate.tau is not None
@@ -232,6 +418,7 @@ def run_rebalance_grid(
                 sampler_mode=str(candidate.sampler_mode),
                 device=device,
                 head_prefix=head_prefix,
+                rebalance_manifest_summary=rebalance_manifest_summary,
             )
         elif candidate.method == "lws":
             retrain_classifier_head(
@@ -247,6 +434,7 @@ def run_rebalance_grid(
                 device=device,
                 head_prefix=head_prefix,
                 rebalance_method="lws",
+                rebalance_manifest_summary=rebalance_manifest_summary,
             )
     return candidates
 
@@ -301,16 +489,44 @@ def validate_rebalance_grid(
 
 
 def validate_cli_args(args: argparse.Namespace) -> None:
+    prepare_folds = bool(getattr(args, "prepare_folds", False))
+    if not prepare_folds and getattr(args, "checkpoint", None) is None:
+        raise ValueError("--checkpoint is required unless --prepare-folds is set")
+    if prepare_folds:
+        mixed_options = (
+            bool(getattr(args, "run", False))
+            or bool(getattr(args, "validate", False))
+            or getattr(args, "baseline_metrics", None) is not None
+            or bool(getattr(args, "candidate_metrics", None))
+            or getattr(args, "checkpoint", None) is not None
+            or getattr(args, "val_dir", None) is not None
+            or getattr(args, "val_csv", None) is not None
+            or getattr(args, "rebalance_manifest_summary", None) is not None
+        )
+        if mixed_options:
+            raise ValueError("--prepare-folds cannot be combined with grid runtime options")
     if args.validate:
         if args.baseline_metrics is not None or args.candidate_metrics:
             raise ValueError("Do not combine --validate with --baseline-metrics or --candidate-metrics")
         if args.val_dir is None and args.val_csv is None:
             raise ValueError("--validate requires --val-dir or --val-csv")
+    if (
+        not prepare_folds
+        and getattr(args, "run", False)
+        and (getattr(args, "crt_sampler_mode", None) or getattr(args, "lws_sampler_mode", None))
+        and getattr(args, "rebalance_manifest_summary", None) is None
+    ):
+        raise ValueError("--run with cRT/LWS requires --rebalance-manifest-summary from --prepare-folds")
+    if prepare_folds:
+        if args.train_csv is None and args.train_dir is None:
+            raise ValueError("--prepare-folds requires --train-csv or --train-dir")
+        if args.train_csv is not None and args.class_map is None:
+            raise ValueError("--prepare-folds with --train-csv requires --class-map")
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build and summarize tau/crt classifier rebalance grids.")
-    parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument("--checkpoint", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--tau", type=float, nargs="*", default=[0.25, 0.5, 0.75, 1.0])
     parser.add_argument("--crt-sampler-mode", nargs="*", default=["sqrt", "class_balanced"])
@@ -318,6 +534,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-csv", type=Path, default=None)
     parser.add_argument("--train-dir", type=Path, default=None)
     parser.add_argument("--image-root", type=Path, default=None)
+    parser.add_argument("--class-map", type=Path, default=None)
+    parser.add_argument("--prepare-folds", action="store_true")
+    parser.add_argument("--folds", type=int, default=5)
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--run", action="store_true")
     parser.add_argument("--epochs", type=int, default=4)
     parser.add_argument("--batch-size", type=int, default=32)
@@ -332,6 +552,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val-batch-size", type=int, default=64)
     parser.add_argument("--baseline-metrics", type=Path, default=None)
     parser.add_argument("--candidate-metrics", type=Path, nargs="*", default=None)
+    parser.add_argument("--rebalance-manifest-summary", type=Path, default=None)
     parser.add_argument("--min-delta-macro-f1", type=float, default=0.0)
     parser.add_argument("--min-per-class-f1", type=float, default=0.0)
     parser.add_argument("--tie-epsilon", type=float, default=0.0)
@@ -341,6 +562,20 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     validate_cli_args(args)
+    if args.prepare_folds:
+        payload = build_fold_safe_rebalance_manifests(
+            train_csv=args.train_csv,
+            train_dir=args.train_dir,
+            image_root=args.image_root,
+            class_map=args.class_map,
+            output_dir=args.output_dir / "fold_safe_manifests",
+            folds=args.folds,
+            seed=args.seed,
+        )
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        return
+    if args.checkpoint is None:
+        raise ValueError("--checkpoint is required unless --prepare-folds is set")
     candidates = run_rebalance_grid(
         checkpoint=args.checkpoint,
         output_dir=args.output_dir,
@@ -357,6 +592,7 @@ def main() -> None:
         device=args.device,
         head_key=args.head_key,
         head_prefix=args.head_prefix,
+        rebalance_manifest_summary=args.rebalance_manifest_summary,
     )
     payload: dict[str, object] = {
         "candidates": [candidate.__dict__ | {"checkpoint": str(candidate.checkpoint), "output": str(candidate.output)} for candidate in candidates]

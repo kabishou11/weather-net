@@ -6,7 +6,7 @@ from pathlib import Path
 
 import torch
 
-from src.weather_net.data import build_manifest_from_csv, build_manifest_from_image_folder, idx_to_class
+from src.weather_net.data import build_manifest_from_csv, build_manifest_from_image_folder, idx_to_class, is_validation_source
 from src.weather_net.datasets import WeatherImageDataset, build_transforms
 from src.weather_net.error_analysis import (
     build_prediction_records,
@@ -56,6 +56,9 @@ def validate_checkpoint(
         )
     else:
         raise ValueError("Set val_dir or val_csv")
+    non_labeled_sources = sorted({row.source for row in rows if not is_validation_source(row)})
+    if non_labeled_sources:
+        raise ValueError(f"validation data must contain only labeled rows; found sources: {non_labeled_sources}")
 
     dataset = WeatherImageDataset(rows, transform=build_transforms(image_size, train=False), return_path=True)
     loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=False)

@@ -256,10 +256,25 @@ python3 classifier_rebalance.py \
 cRT 分类头重训：
 
 ```bash
+python3 classifier_rebalance_grid.py \
+  --prepare-folds \
+  --train-csv data/train.csv \
+  --image-root data/images \
+  --class-map outputs/convnextv2_384/class_to_idx.json \
+  --output-dir outputs/convnextv2_384/rebalance_grid \
+  --folds 5 \
+  --seed 42
+```
+
+上面的命令会生成 `outputs/convnextv2_384/rebalance_grid/fold_safe_manifests/fold{n}_rebalance_train.csv` 和 `fold{n}_rebalance_val.csv`。这些清单只包含 `source=labeled` 的真实标注样本，伪标签和外部样本会进入 audit 的 excluded 统计，不能参与 cRT/LWS 分类头校准。
+`--prepare-folds` 是独立准备模式，不要和 `--checkpoint`、`--run`、`--validate` 或 metrics 参数混用。
+
+```bash
 python3 classifier_rebalance.py \
   --method crt \
   --checkpoint outputs/convnextv2_384/convnextv2_tiny.fcmae_ft_in22k_in1k_fold0.pt \
-  --train-csv data/train.csv \
+  --train-csv outputs/convnextv2_384/rebalance_grid/fold_safe_manifests/fold0_rebalance_train.csv \
+  --rebalance-manifest-summary outputs/convnextv2_384/rebalance_grid/fold_safe_manifests/fold_safe_rebalance_manifests.json \
   --image-root data/images \
   --output outputs/convnextv2_384/convnextv2_tiny.fcmae_ft_in22k_in1k_fold0_crt.pt \
   --epochs 4 \
@@ -267,7 +282,7 @@ python3 classifier_rebalance.py \
   --sampler-mode sqrt
 ```
 
-`--method crt` 会加载已有 checkpoint，冻结 backbone，只训练分类头参数；训练数据会强制沿用 checkpoint 内的 `class_to_idx`，避免重新读 CSV 时类别顺序变化导致标签错位。默认用 `sqrt` 采样在类均衡和原分布之间折中，也可用 `class_balanced` 做更强尾类纠偏。该步骤训练成本很低、推理成本不变，适合在强 backbone 收敛后修正长尾类别决策边界。建议先对单 fold 或 OOF 最差类别对应 fold 快筛，再扩展到所有 fold；若大类 precision 明显下降，则回退到原 checkpoint 或 tau-norm。
+`--method crt` 会加载已有 checkpoint，冻结 backbone，只训练分类头参数；训练数据会强制沿用 checkpoint 内的 `class_to_idx`，避免重新读 CSV 时类别顺序变化导致标签错位。对 K 折 checkpoint，脚本会要求 `--rebalance-manifest-summary` 并校验 `train_csv` 必须等于该 checkpoint `fold` 对应的 `fold{n}_rebalance_train.csv`，同时校验该 CSV 的行摘要，防止用全量 labeled CSV 或被覆盖的同名 CSV 把验证 fold 喂进 cRT。默认用 `sqrt` 采样在类均衡和原分布之间折中，也可用 `class_balanced` 做更强尾类纠偏。该步骤训练成本很低、推理成本不变，适合在强 backbone 收敛后修正长尾类别决策边界。建议先对单 fold 或 OOF 最差类别对应 fold 快筛，再扩展到所有 fold；若大类 precision 明显下降，则回退到原 checkpoint 或 tau-norm。
 
 LWS 分类头缩放：
 
@@ -275,7 +290,8 @@ LWS 分类头缩放：
 python3 classifier_rebalance.py \
   --method lws \
   --checkpoint outputs/convnextv2_384/convnextv2_tiny.fcmae_ft_in22k_in1k_fold0.pt \
-  --train-csv data/train.csv \
+  --train-csv outputs/convnextv2_384/rebalance_grid/fold_safe_manifests/fold0_rebalance_train.csv \
+  --rebalance-manifest-summary outputs/convnextv2_384/rebalance_grid/fold_safe_manifests/fold_safe_rebalance_manifests.json \
   --image-root data/images \
   --output outputs/convnextv2_384/convnextv2_tiny.fcmae_ft_in22k_in1k_fold0_lws.pt \
   --epochs 4 \
@@ -294,7 +310,8 @@ python3 classifier_rebalance_grid.py \
   --tau 0.25 0.5 0.75 1.0 \
   --crt-sampler-mode sqrt class_balanced \
   --lws-sampler-mode sqrt class_balanced \
-  --train-csv data/train.csv \
+  --train-csv outputs/convnextv2_384/rebalance_grid/fold_safe_manifests/fold0_rebalance_train.csv \
+  --rebalance-manifest-summary outputs/convnextv2_384/rebalance_grid/fold_safe_manifests/fold_safe_rebalance_manifests.json \
   --image-root data/images \
   --run
 ```
@@ -323,11 +340,12 @@ python3 classifier_rebalance_grid.py \
   --tau 0.25 0.5 0.75 1.0 \
   --crt-sampler-mode sqrt class_balanced \
   --lws-sampler-mode sqrt class_balanced \
-  --train-csv data/train.csv \
+  --train-csv outputs/convnextv2_384/rebalance_grid/fold_safe_manifests/fold0_rebalance_train.csv \
+  --rebalance-manifest-summary outputs/convnextv2_384/rebalance_grid/fold_safe_manifests/fold_safe_rebalance_manifests.json \
   --image-root data/images \
   --run \
   --validate \
-  --val-csv data/val.csv \
+  --val-csv outputs/convnextv2_384/rebalance_grid/fold_safe_manifests/fold0_rebalance_val.csv \
   --val-image-root data/images \
   --val-batch-size 64 \
   --min-delta-macro-f1 0.003 \

@@ -295,6 +295,170 @@ def test_load_training_manifest_from_args_uses_checkpoint_class_mapping(tmp_path
     assert [(row.label_name, row.label) for row in rows] == [("sunny", 0), ("rain", 1)]
 
 
+def test_load_training_manifest_from_args_rejects_external_rows(tmp_path: Path) -> None:
+    import pytest
+
+    from classifier_rebalance import load_training_manifest_from_args
+
+    csv_path = tmp_path / "train.csv"
+    csv_path.write_text(
+        "image,label,source,sample_weight\n"
+        "rain.jpg,rain,labeled,1.0\n"
+        "external.jpg,rain,external_weather,0.3\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="only labeled rows"):
+        load_training_manifest_from_args(
+            train_csv=csv_path,
+            train_dir=None,
+            image_root=tmp_path,
+            class_to_idx={"rain": 0},
+        )
+
+
+def test_retrain_classifier_head_rejects_fold_checkpoint_without_summary(tmp_path: Path) -> None:
+    import pytest
+    import torch
+    from torch import nn
+
+    import classifier_rebalance
+
+    class TinyModel(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.classifier = nn.Linear(2, 2)
+
+        def forward(self, x):
+            return self.classifier(x)
+
+    checkpoint = {
+        "model_state": TinyModel().state_dict(),
+        "class_to_idx": {"rain": 0, "sunny": 1},
+        "model_name": "tiny",
+        "image_size": 8,
+        "fold": 0,
+        "config": {"data": {"folds": 5}},
+    }
+    checkpoint_path = tmp_path / "fold0.pt"
+    torch.save(checkpoint, checkpoint_path)
+
+    with pytest.raises(ValueError, match="rebalance manifest summary"):
+        classifier_rebalance.retrain_classifier_head(
+            checkpoint_path=checkpoint_path,
+            output_path=tmp_path / "crt.pt",
+            train_csv=tmp_path / "train.csv",
+            train_dir=None,
+            device="cpu",
+            num_workers=0,
+        )
+
+
+def test_validate_rebalance_manifest_summary_rejects_wrong_fold_train_csv(tmp_path: Path) -> None:
+    import json
+    import pytest
+    import torch
+    from torch import nn
+
+    from classifier_rebalance import validate_rebalance_manifest_summary
+
+    class TinyModel(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.classifier = nn.Linear(2, 2)
+
+    checkpoint = {
+        "model_state": TinyModel().state_dict(),
+        "class_to_idx": {"rain": 0, "sunny": 1},
+        "fold": 0,
+        "config": {"data": {"folds": 5}},
+    }
+    checkpoint_path = tmp_path / "fold0.pt"
+    torch.save(checkpoint, checkpoint_path)
+    summary_path = tmp_path / "fold_safe_rebalance_manifests.json"
+    summary_path.write_text(
+        json.dumps(
+            {
+                "folds": [
+                    {
+                        "fold": 0,
+                        "train_csv": str(tmp_path / "fold0_rebalance_train.csv"),
+                        "val_csv": str(tmp_path / "fold0_rebalance_val.csv"),
+                        "train_rows": 2,
+                        "val_rows": 1,
+                        "train_source_counts": {"labeled": 2},
+                        "val_source_counts": {"labeled": 1},
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="does not match fold-safe train_csv"):
+        validate_rebalance_manifest_summary(
+            checkpoint=checkpoint,
+            checkpoint_path=checkpoint_path,
+            train_csv=tmp_path / "full_train.csv",
+            summary_path=summary_path,
+        )
+
+
+def test_validate_rebalance_manifest_summary_rejects_train_csv_digest_mismatch(tmp_path: Path) -> None:
+    import json
+    import pytest
+    import torch
+    from torch import nn
+
+    from classifier_rebalance import validate_rebalance_manifest_summary
+    from src.weather_net.data import ManifestRow
+
+    class TinyModel(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.classifier = nn.Linear(2, 2)
+
+    checkpoint = {
+        "model_state": TinyModel().state_dict(),
+        "class_to_idx": {"rain": 0, "sunny": 1},
+        "fold": 0,
+        "config": {"data": {"folds": 5}},
+    }
+    checkpoint_path = tmp_path / "fold0.pt"
+    train_csv = tmp_path / "fold0_rebalance_train.csv"
+    torch.save(checkpoint, checkpoint_path)
+    summary_path = tmp_path / "fold_safe_rebalance_manifests.json"
+    summary_path.write_text(
+        json.dumps(
+            {
+                "folds": [
+                    {
+                        "fold": 0,
+                        "train_csv": str(train_csv),
+                        "val_csv": str(tmp_path / "fold0_rebalance_val.csv"),
+                        "train_rows": 1,
+                        "val_rows": 1,
+                        "train_source_counts": {"labeled": 1},
+                        "val_source_counts": {"labeled": 1},
+                        "train_row_digest": "stale-digest",
+                        "val_row_digest": "unused-here",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="row digest"):
+        validate_rebalance_manifest_summary(
+            checkpoint=checkpoint,
+            checkpoint_path=checkpoint_path,
+            train_csv=train_csv,
+            summary_path=summary_path,
+            rows=[ManifestRow(path=tmp_path / "rain.jpg", label=0, label_name="rain")],
+        )
+
+
 def test_retrain_classifier_head_freezes_backbone_and_writes_metadata(monkeypatch, tmp_path: Path) -> None:
     from torch import nn
     from torch.utils.data import DataLoader, TensorDataset

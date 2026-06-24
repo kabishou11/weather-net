@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
-from typing import Mapping
+from typing import Any, Mapping
 
 import numpy as np
 import torch
@@ -120,9 +121,140 @@ def load_training_manifest_from_args(
         rows, _mapping = build_manifest_from_image_folder(train_dir, class_to_idx=class_to_idx)
     else:
         raise ValueError("Set --train-csv or --train-dir for classifier re-training")
-    if any(row.source == "pseudo" for row in rows):
-        raise ValueError("classifier re-training should use labeled rows, not pseudo labels")
+    non_labeled_sources = sorted({row.source for row in rows if row.source != "labeled"})
+    if non_labeled_sources:
+        raise ValueError(
+            "classifier re-training should use only labeled rows; "
+            f"found sources: {non_labeled_sources}"
+        )
     return rows
+
+
+def _resolve_user_path(path: Path) -> Path:
+    return path.expanduser().resolve()
+
+
+def _row_id(row: ManifestRow) -> str:
+    return row.image_id or str(row.path)
+
+
+def _row_digest(rows: list[ManifestRow]) -> str:
+    payload = [
+        {
+            "image": _row_id(row),
+            "label": row.label_name,
+            "source": row.source,
+            "confidence": float(row.confidence),
+            "sample_weight": float(row.sample_weight),
+        }
+        for row in rows
+    ]
+    encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _checkpoint_fold(checkpoint: Mapping[str, Any]) -> int | None:
+    config = checkpoint.get("config")
+    if isinstance(config, dict):
+        data_config = config.get("data")
+        if isinstance(data_config, dict):
+            folds = int(data_config.get("folds", 1))
+            if folds <= 1:
+                return None
+    if "fold" not in checkpoint:
+        return None
+    fold = checkpoint["fold"]
+    if fold is None:
+        return None
+    try:
+        return int(fold)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"checkpoint fold must be an integer: {fold!r}") from error
+
+
+def _source_counts_are_labeled_only(value: object) -> bool:
+    if not isinstance(value, dict):
+        return False
+    normalized = {str(source): int(count) for source, count in value.items()}
+    return set(normalized) == {"labeled"} and normalized["labeled"] > 0
+
+
+def validate_rebalance_manifest_summary(
+    checkpoint: Mapping[str, Any],
+    checkpoint_path: Path,
+    train_csv: Path | None,
+    summary_path: Path | None,
+    rows: list[ManifestRow] | None = None,
+) -> dict[str, object] | None:
+    fold = _checkpoint_fold(checkpoint)
+    if fold is None:
+        return None
+    if summary_path is None:
+        raise ValueError(
+            "rebalance manifest summary is required for fold checkpoint; "
+            "pass --rebalance-manifest-summary from classifier_rebalance_grid.py --prepare-folds"
+        )
+    if train_csv is None:
+        raise ValueError("fold-safe classifier re-training requires --train-csv from the rebalance manifest summary")
+    try:
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        raise ValueError(f"rebalance manifest summary is not valid JSON: {summary_path}") from error
+    if not isinstance(summary, dict):
+        raise ValueError("rebalance manifest summary must be a JSON object")
+    fold_entries = summary.get("folds")
+    if not isinstance(fold_entries, list):
+        raise ValueError("rebalance manifest summary is missing folds")
+    fold_entry = None
+    for item in fold_entries:
+        if isinstance(item, dict) and int(item.get("fold", -1)) == fold:
+            fold_entry = item
+            break
+    if fold_entry is None:
+        raise ValueError(f"rebalance manifest summary has no entry for checkpoint fold {fold}")
+    expected_train_csv = fold_entry.get("train_csv")
+    if not isinstance(expected_train_csv, str) or not expected_train_csv:
+        raise ValueError(f"rebalance manifest summary fold {fold} is missing train_csv")
+    actual_train_csv = _resolve_user_path(train_csv)
+    expected_train_path = _resolve_user_path(Path(expected_train_csv))
+    if actual_train_csv != expected_train_path:
+        raise ValueError(
+            "train_csv does not match fold-safe train_csv for checkpoint fold "
+            f"{fold}: {actual_train_csv} != {expected_train_path}"
+        )
+    if not _source_counts_are_labeled_only(fold_entry.get("train_source_counts")):
+        raise ValueError(f"rebalance manifest summary fold {fold} train_source_counts must be labeled-only")
+    if not _source_counts_are_labeled_only(fold_entry.get("val_source_counts")):
+        raise ValueError(f"rebalance manifest summary fold {fold} val_source_counts must be labeled-only")
+    if int(fold_entry.get("train_rows", 0)) <= 0 or int(fold_entry.get("val_rows", 0)) <= 0:
+        raise ValueError(f"rebalance manifest summary fold {fold} must have positive train_rows and val_rows")
+    if rows is not None:
+        current_train_digest = _row_digest(rows)
+        expected_train_digest = fold_entry.get("train_row_digest")
+        if isinstance(expected_train_digest, str) and expected_train_digest and current_train_digest != expected_train_digest:
+            raise ValueError(
+                "train_csv row digest does not match fold-safe manifest summary for checkpoint fold "
+                f"{fold}: {current_train_digest} != {expected_train_digest}"
+            )
+    val_csv = fold_entry.get("val_csv")
+    if isinstance(val_csv, str) and val_csv:
+        val_path = _resolve_user_path(Path(val_csv))
+        if val_path == expected_train_path:
+            raise ValueError(f"rebalance manifest summary fold {fold} uses the same train_csv and val_csv")
+    return {
+        "summary_json": str(_resolve_user_path(summary_path)),
+        "checkpoint": str(_resolve_user_path(checkpoint_path)),
+        "fold": fold,
+        "train_csv": str(expected_train_path),
+        "val_csv": val_csv,
+        "train_rows": int(fold_entry["train_rows"]),
+        "val_rows": int(fold_entry["val_rows"]),
+        "train_source_counts": dict(fold_entry["train_source_counts"]),
+        "val_source_counts": dict(fold_entry["val_source_counts"]),
+        "labeled_row_digest": summary.get("labeled_row_digest"),
+        "train_row_digest": fold_entry.get("train_row_digest"),
+        "val_row_digest": fold_entry.get("val_row_digest"),
+    }
 
 
 def build_crt_loader(
@@ -319,6 +451,7 @@ def retrain_classifier_head(
     transform_backend: str = "auto",
     amp: bool = False,
     rebalance_method: str = "crt",
+    rebalance_manifest_summary: Path | None = None,
 ) -> dict[str, object]:
     if rebalance_method not in {"crt", "lws"}:
         raise ValueError("rebalance_method must be one of: crt, lws")
@@ -336,6 +469,26 @@ def retrain_classifier_head(
     if "model_state" not in checkpoint or "class_to_idx" not in checkpoint:
         raise ValueError("checkpoint must contain model_state and class_to_idx")
     class_to_idx = validate_class_to_idx(checkpoint["class_to_idx"])
+    rebalance_manifest_audit = validate_rebalance_manifest_summary(
+        checkpoint=checkpoint,
+        checkpoint_path=checkpoint_path,
+        train_csv=train_csv,
+        summary_path=rebalance_manifest_summary,
+    )
+    rows = load_training_manifest_from_args(
+        train_csv=train_csv,
+        train_dir=train_dir,
+        image_root=image_root,
+        class_to_idx=class_to_idx,
+    )
+    if rebalance_manifest_audit is not None:
+        rebalance_manifest_audit = validate_rebalance_manifest_summary(
+            checkpoint=checkpoint,
+            checkpoint_path=checkpoint_path,
+            train_csv=train_csv,
+            summary_path=rebalance_manifest_summary,
+            rows=rows,
+        )
     model_name = str(checkpoint.get("model_name", "convnext_tiny"))
     image_size = int(checkpoint.get("image_size", 224))
     model = create_classifier(
@@ -354,12 +507,6 @@ def retrain_classifier_head(
         trainable = freeze_backbone_for_classifier_retraining(model, head_prefix=head_prefix)
         state_keys = {name: parameter for name, parameter in model.named_parameters()}
         resolved_head_key = _resolve_head_weight_key_from_prefix(state_keys, head_prefix)
-    rows = load_training_manifest_from_args(
-        train_csv=train_csv,
-        train_dir=train_dir,
-        image_root=image_root,
-        class_to_idx=class_to_idx,
-    )
     loader = build_crt_loader(
         rows,
         image_size=image_size,
@@ -432,6 +579,8 @@ def retrain_classifier_head(
         "head_key": resolved_head_key,
         "source_checkpoint": str(checkpoint_path),
     }
+    if rebalance_manifest_audit is not None:
+        output_checkpoint["rebalance"]["manifest_summary"] = rebalance_manifest_audit
     if learned_scales is not None:
         output_checkpoint["rebalance"]["scales"] = learned_scales
         output_checkpoint["rebalance"]["scale_by_class"] = scale_by_class
@@ -450,6 +599,7 @@ def retrain_classifier_head(
         "losses": losses,
         "source": str(checkpoint_path),
         "output": str(output_path),
+        "manifest_summary": rebalance_manifest_audit,
     }
 
 
@@ -474,6 +624,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--transform-backend", type=str, default="auto")
     parser.add_argument("--amp", action="store_true")
+    parser.add_argument("--rebalance-manifest-summary", type=Path, default=None)
     return parser.parse_args()
 
 
@@ -505,6 +656,7 @@ def main() -> None:
             transform_backend=args.transform_backend,
             amp=args.amp,
             rebalance_method=args.method,
+            rebalance_manifest_summary=args.rebalance_manifest_summary,
         )
     print(json.dumps(summary, indent=2, ensure_ascii=False))
 
