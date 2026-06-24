@@ -235,6 +235,17 @@ python3 soup_checkpoints.py \
 
 传入 `--oof` 时会先用 OOF logits 做 greedy 权重搜索，只保留不低于最佳单 checkpoint macro F1 的 soup 权重，再平均模型参数。这个 OOF 分数用于 gate logits 权重，不等价于 soup checkpoint 的最终验证分数；生成后建议再用 `validate.py` 跑一次本地验证。这个步骤适合同一架构、同类别映射、同输入尺寸的多 seed 或 late checkpoint；不要跨架构 soup，跨架构请继续用 logits ensemble 或 OOF 决策层。
 
+分类头 tau-normalization 去偏：
+
+```bash
+python3 classifier_rebalance.py \
+  --checkpoint outputs/convnextv2_384/convnextv2_tiny.fcmae_ft_in22k_in1k_fold0.pt \
+  --output outputs/convnextv2_384/convnextv2_tiny.fcmae_ft_in22k_in1k_fold0_tau.pt \
+  --tau 0.5
+```
+
+`classifier_rebalance.py` 会只调整 checkpoint 中 `classifier/head/fc.weight` 每个类别权重向量的范数，不改变权重方向，也不改变模型结构。它用于快速 A/B 长尾分类头去偏，推理成本为零；建议用 `tau=0.25/0.5/0.75/1.0` 网格在 OOF 或本地验证集上筛选，只有 macro F1 和低 F1 类别同时改善时再替换提交 checkpoint。若 checkpoint 中存在多个分类头候选，脚本会要求显式传 `--head-key`，避免自动改错头。
+
 ## 伪标签
 
 对未标注图片生成高置信伪标签：
