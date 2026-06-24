@@ -40,6 +40,7 @@ class TrainConfig:
     weight_decay: float = 1e-4
     label_smoothing: float = 0.05
     loss_name: str = "ce"
+    loss_warmup_epochs: int = 0
     focal_gamma: float = 0.0
     class_balanced_beta: float = 0.999
     ldam_max_margin: float = 0.5
@@ -121,6 +122,8 @@ def _validate_config(config: AppConfig) -> None:
         )
     if config.train.focal_gamma < 0:
         raise ValueError("train.focal_gamma must be non-negative")
+    if config.train.loss_warmup_epochs < 0:
+        raise ValueError("train.loss_warmup_epochs must be non-negative")
     if not 0 <= config.train.class_balanced_beta < 1:
         raise ValueError("train.class_balanced_beta must be in [0, 1)")
     if config.train.ldam_max_margin <= 0:

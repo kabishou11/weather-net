@@ -54,6 +54,7 @@ def _config_to_payload(config: AppConfig) -> dict[str, object]:
             "weight_decay": config.train.weight_decay,
             "label_smoothing": config.train.label_smoothing,
             "loss_name": config.train.loss_name,
+            "loss_warmup_epochs": config.train.loss_warmup_epochs,
             "focal_gamma": config.train.focal_gamma,
             "class_balanced_beta": config.train.class_balanced_beta,
             "sampler_mode": config.train.sampler_mode,

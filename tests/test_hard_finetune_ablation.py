@@ -20,6 +20,7 @@ def test_build_ablation_configs_sets_usage_and_output_dirs(tmp_path: Path) -> No
     for item in outputs:
         payload = yaml.safe_load(item.config_path.read_text(encoding="utf-8"))
         assert payload["train"]["sample_weight_usage"] == item.usage
+        assert "loss_warmup_epochs" in payload["train"]
         assert payload["train"]["output_dir"] == str(tmp_path / "ablation" / item.usage)
         expected_sampler = "auto" if item.usage == "loss" else "sample_weighted"
         assert payload["train"]["sampler_mode"] == expected_sampler

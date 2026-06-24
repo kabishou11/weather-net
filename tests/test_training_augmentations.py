@@ -565,6 +565,139 @@ def test_train_one_epoch_requires_ldam_margins_for_ldam() -> None:
         )
 
 
+def test_train_one_epoch_uses_ce_during_loss_warmup() -> None:
+    from torch import nn
+    from torch.utils.data import DataLoader, TensorDataset
+
+    from src.weather_net.training import train_one_epoch
+
+    loader = DataLoader(
+        TensorDataset(
+            torch.randn(2, 3, 4, 4),
+            torch.tensor([0, 1]),
+            torch.ones(2),
+        ),
+        batch_size=2,
+    )
+    model = nn.Sequential(nn.Flatten(), nn.Linear(3 * 4 * 4, 2))
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    scaler = torch.amp.GradScaler("cuda", enabled=False)
+
+    loss = train_one_epoch(
+        model,
+        loader,
+        optimizer,
+        scaler,
+        device="cpu",
+        num_classes=2,
+        label_smoothing=0.0,
+        mixup_alpha=0.0,
+        cutmix_alpha=0.0,
+        amp=False,
+        loss_name="ldam",
+        loss_warmup_epochs=1,
+        epoch=1,
+    )
+
+    assert loss > 0
+
+
+def test_train_one_epoch_keeps_explicit_ce_class_weights_without_warmup(monkeypatch) -> None:
+    from torch import nn
+    from torch.utils.data import DataLoader, TensorDataset
+
+    from src.weather_net import training
+
+    seen_class_weights: list[torch.Tensor | None] = []
+    original_loss = training.weighted_soft_cross_entropy
+
+    def capture_loss(*args, **kwargs):
+        seen_class_weights.append(kwargs.get("class_weights"))
+        return original_loss(*args, **kwargs)
+
+    monkeypatch.setattr(training, "weighted_soft_cross_entropy", capture_loss)
+    loader = DataLoader(
+        TensorDataset(
+            torch.randn(2, 3, 4, 4),
+            torch.tensor([0, 1]),
+            torch.ones(2),
+        ),
+        batch_size=2,
+    )
+    model = nn.Sequential(nn.Flatten(), nn.Linear(3 * 4 * 4, 2))
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    scaler = torch.amp.GradScaler("cuda", enabled=False)
+    class_weights = torch.tensor([1.0, 3.0])
+
+    training.train_one_epoch(
+        model,
+        loader,
+        optimizer,
+        scaler,
+        device="cpu",
+        num_classes=2,
+        label_smoothing=0.0,
+        mixup_alpha=0.0,
+        cutmix_alpha=0.0,
+        amp=False,
+        loss_name="ce",
+        class_weights=class_weights,
+    )
+
+    assert seen_class_weights
+    assert seen_class_weights[0] is not None
+    assert torch.equal(seen_class_weights[0].cpu(), class_weights)
+
+
+def test_effective_loss_name_for_epoch_applies_warmup_boundary() -> None:
+    import pytest
+
+    from src.weather_net.training import effective_loss_name_for_epoch
+
+    assert effective_loss_name_for_epoch("ldam", epoch=1, loss_warmup_epochs=2) == "ce"
+    assert effective_loss_name_for_epoch("ldam", epoch=2, loss_warmup_epochs=2) == "ce"
+    assert effective_loss_name_for_epoch("ldam", epoch=3, loss_warmup_epochs=2) == "ldam"
+    with pytest.raises(ValueError, match="epoch"):
+        effective_loss_name_for_epoch("ldam", epoch=0)
+
+
+def test_train_one_epoch_requires_ldam_margins_after_loss_warmup() -> None:
+    import pytest
+    from torch import nn
+    from torch.utils.data import DataLoader, TensorDataset
+
+    from src.weather_net.training import train_one_epoch
+
+    loader = DataLoader(
+        TensorDataset(
+            torch.randn(2, 3, 4, 4),
+            torch.tensor([0, 1]),
+            torch.ones(2),
+        ),
+        batch_size=2,
+    )
+    model = nn.Sequential(nn.Flatten(), nn.Linear(3 * 4 * 4, 2))
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    scaler = torch.amp.GradScaler("cuda", enabled=False)
+
+    with pytest.raises(ValueError, match="ldam_margins"):
+        train_one_epoch(
+            model,
+            loader,
+            optimizer,
+            scaler,
+            device="cpu",
+            num_classes=2,
+            label_smoothing=0.0,
+            mixup_alpha=0.0,
+            cutmix_alpha=0.0,
+            amp=False,
+            loss_name="ldam",
+            loss_warmup_epochs=1,
+            epoch=2,
+        )
+
+
 def test_train_one_epoch_rejects_jsd_weight_for_single_view_batches() -> None:
     import pytest
     from torch import nn

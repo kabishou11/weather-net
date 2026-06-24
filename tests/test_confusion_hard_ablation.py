@@ -50,6 +50,7 @@ def test_build_confusion_hard_ablation_configs_generates_weighted_csv_and_config
     assert payload["data"]["train_csv"] == str(tmp_path / "ablation" / "pair0p40" / "train_confusion_hard_weighted.csv")
     assert payload["data"]["folds"] == 3
     assert payload["train"]["epochs"] == 2
+    assert "loss_warmup_epochs" in payload["train"]
     assert payload["train"]["sample_weight_usage"] == "sampler"
     assert payload["train"]["sampler_mode"] == "sample_weighted"
     assert payload["train"]["output_dir"] == str(tmp_path / "ablation" / "pair0p40" / "train")

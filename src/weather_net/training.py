@@ -484,6 +484,8 @@ def train_one_epoch(
     cutmix_alpha: float,
     amp: bool,
     loss_name: str = "ce",
+    loss_warmup_epochs: int = 0,
+    epoch: int = 1,
     focal_gamma: float = 0.0,
     class_weights: torch.Tensor | None = None,
     class_counts: torch.Tensor | None = None,
@@ -499,9 +501,16 @@ def train_one_epoch(
     class_weights = None if class_weights is None else class_weights.to(device)
     class_counts = None if class_counts is None else class_counts.to(device)
     ldam_margins = None if ldam_margins is None else ldam_margins.to(device)
-    use_focal = loss_name in {"focal", "class_balanced_focal"}
-    use_balanced_softmax = loss_name == "balanced_softmax"
-    use_ldam = loss_name == "ldam"
+    effective_loss_name = effective_loss_name_for_epoch(
+        loss_name=loss_name,
+        epoch=epoch,
+        loss_warmup_epochs=loss_warmup_epochs,
+    )
+    loss_warmup_active = effective_loss_name != loss_name
+    effective_class_weights = None if loss_warmup_active else class_weights
+    use_focal = effective_loss_name in {"focal", "class_balanced_focal"}
+    use_balanced_softmax = effective_loss_name == "balanced_softmax"
+    use_ldam = effective_loss_name == "ldam"
 
     if jsd_weight < 0:
         raise ValueError("jsd_weight must be non-negative")
@@ -558,7 +567,7 @@ def train_one_epoch(
                         logits,
                         weighted_targets,
                         sample_weights=None,
-                        class_weights=class_weights,
+                        class_weights=effective_class_weights,
                         focal_gamma=focal_gamma if use_focal else 0.0,
                     )
             else:
@@ -588,7 +597,7 @@ def train_one_epoch(
                         logits,
                         soft_targets,
                         sample_weights=sample_weights,
-                        class_weights=class_weights,
+                        class_weights=effective_class_weights,
                         focal_gamma=focal_gamma if use_focal else 0.0,
                     )
             if augmix_views:
@@ -605,6 +614,14 @@ def train_one_epoch(
         total_loss += float(loss.detach().cpu()) * images.size(0)
         total_items += images.size(0)
     return total_loss / max(1, total_items)
+
+
+def effective_loss_name_for_epoch(loss_name: str, epoch: int, loss_warmup_epochs: int = 0) -> str:
+    if epoch <= 0:
+        raise ValueError("epoch must be positive")
+    if loss_warmup_epochs < 0:
+        raise ValueError("loss_warmup_epochs must be non-negative")
+    return "ce" if epoch <= loss_warmup_epochs else loss_name
 
 
 @torch.no_grad()
@@ -857,6 +874,8 @@ def train_config(config: AppConfig, device_request: str = "auto") -> list[Path]:
                 cutmix_alpha=config.train.cutmix_alpha,
                 amp=config.train.amp,
                 loss_name=config.train.loss_name,
+                loss_warmup_epochs=config.train.loss_warmup_epochs,
+                epoch=epoch,
                 focal_gamma=config.train.focal_gamma,
                 class_weights=class_weights,
                 class_counts=class_counts,
@@ -874,6 +893,12 @@ def train_config(config: AppConfig, device_request: str = "auto") -> list[Path]:
                     {
                         "fold": fold,
                         "epoch": epoch,
+                        "loss_name": config.train.loss_name,
+                        "effective_loss_name": effective_loss_name_for_epoch(
+                            config.train.loss_name,
+                            epoch=epoch,
+                            loss_warmup_epochs=config.train.loss_warmup_epochs,
+                        ),
                         "train_loss": round(train_loss, 6),
                         "val_loss": round(val_loss, 6),
                         "macro_f1": round(report.macro_f1, 6),

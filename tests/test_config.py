@@ -111,7 +111,8 @@ def test_load_config_accepts_ldam_loss_options(tmp_path: Path) -> None:
         "train:\n"
         "  loss_name: ldam\n"
         "  ldam_max_margin: 0.4\n"
-        "  ldam_scale: 20.0\n",
+        "  ldam_scale: 20.0\n"
+        "  loss_warmup_epochs: 2\n",
         encoding="utf-8",
     )
 
@@ -120,6 +121,7 @@ def test_load_config_accepts_ldam_loss_options(tmp_path: Path) -> None:
     assert config.train.loss_name == "ldam"
     assert config.train.ldam_max_margin == 0.4
     assert config.train.ldam_scale == 20.0
+    assert config.train.loss_warmup_epochs == 2
 
 
 def test_load_config_accepts_inference_amp_option(tmp_path: Path) -> None:
@@ -245,6 +247,24 @@ def test_load_config_rejects_invalid_ldam_options(tmp_path: Path) -> None:
         raise AssertionError("invalid ldam_max_margin should fail during config load")
 
 
+def test_load_config_rejects_negative_loss_warmup_epochs(tmp_path: Path) -> None:
+    from src.weather_net.config import load_config
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "train:\n"
+        "  loss_warmup_epochs: -1\n",
+        encoding="utf-8",
+    )
+
+    try:
+        load_config(config_path)
+    except ValueError as error:
+        assert "loss_warmup_epochs" in str(error)
+    else:
+        raise AssertionError("negative loss_warmup_epochs should fail during config load")
+
+
 def test_convnextv2_384_config_is_parseable() -> None:
     from src.weather_net.config import load_config
 
@@ -277,6 +297,7 @@ def test_convnextv2_384_ldam_config_is_parseable() -> None:
     assert config.train.loss_name == "ldam"
     assert config.train.ldam_max_margin == 0.5
     assert config.train.ldam_scale == 30.0
+    assert config.train.loss_warmup_epochs == 2
 
 
 def test_convnextv2_384_augmix_jsd_config_is_parseable() -> None:
