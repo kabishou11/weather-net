@@ -1,0 +1,142 @@
+import json
+from pathlib import Path
+
+
+def test_build_rebalance_grid_generates_tau_and_crt_candidates(tmp_path: Path) -> None:
+    from classifier_rebalance_grid import build_rebalance_grid
+
+    candidates = build_rebalance_grid(
+        checkpoint=Path("fold0.pt"),
+        output_dir=tmp_path,
+        tau_values=[0.5, 1.0],
+        crt_sampler_modes=["sqrt", "class_balanced"],
+    )
+
+    assert [candidate.name for candidate in candidates] == [
+        "tau0p50",
+        "tau1p00",
+        "crt_sqrt",
+        "crt_class_balanced",
+    ]
+    assert candidates[0].method == "tau_norm"
+    assert candidates[0].output == tmp_path / "fold0_tau0p50.pt"
+    assert candidates[2].method == "crt"
+    assert candidates[2].sampler_mode == "sqrt"
+
+
+def test_summarize_rebalance_grid_selects_stable_macro_f1_winner(tmp_path: Path) -> None:
+    from classifier_rebalance_grid import RebalanceCandidate, summarize_rebalance_grid
+
+    candidates = [
+        RebalanceCandidate(name="baseline", method="baseline", checkpoint=Path("base.pt"), output=Path("base.pt")),
+        RebalanceCandidate(name="tau0p50", method="tau_norm", checkpoint=Path("base.pt"), output=Path("tau.pt"), tau=0.5),
+        RebalanceCandidate(
+            name="crt_sqrt",
+            method="crt",
+            checkpoint=Path("base.pt"),
+            output=Path("crt.pt"),
+            sampler_mode="sqrt",
+        ),
+    ]
+    for name, macro_f1, fog_f1 in [
+        ("baseline", 0.740, 0.650),
+        ("tau0p50", 0.748, 0.670),
+        ("crt_sqrt", 0.755, 0.510),
+    ]:
+        path = tmp_path / f"{name}.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "macro_f1": macro_f1,
+                    "per_class_f1": {"fog": fog_f1, "sunny": 0.9},
+                }
+            ),
+            encoding="utf-8",
+        )
+        for candidate in candidates:
+            if candidate.name == name:
+                candidate.metrics_json = path
+
+    summary = summarize_rebalance_grid(
+        candidates,
+        baseline_name="baseline",
+        min_delta_macro_f1=0.003,
+        min_per_class_f1=0.6,
+        tie_epsilon=0.001,
+    )
+
+    assert summary["best_name"] == "tau0p50"
+    rejected = {item["name"]: item["selection_status"] for item in summary["results"]}
+    assert rejected["crt_sqrt"] == "rejected_min_per_class_f1"
+    assert summary["results"][1]["delta_macro_f1_vs_baseline"] == 0.008000000000000007
+
+
+def test_run_rebalance_grid_dispatches_tau_and_crt(monkeypatch, tmp_path: Path) -> None:
+    import classifier_rebalance_grid
+    from classifier_rebalance_grid import run_rebalance_grid
+
+    calls: list[tuple[str, Path, object]] = []
+
+    def fake_tau(checkpoint, output, tau):
+        calls.append(("tau", output, tau))
+        return {"output": str(output)}
+
+    def fake_crt(**kwargs):
+        calls.append(("crt", kwargs["output_path"], kwargs["sampler_mode"]))
+        return {"output": str(kwargs["output_path"])}
+
+    monkeypatch.setattr(classifier_rebalance_grid, "rebalance_checkpoint", fake_tau)
+    monkeypatch.setattr(classifier_rebalance_grid, "retrain_classifier_head", fake_crt)
+
+    candidates = run_rebalance_grid(
+        checkpoint=Path("fold0.pt"),
+        output_dir=tmp_path,
+        tau_values=[0.5],
+        crt_sampler_modes=["sqrt"],
+        train_csv=Path("train.csv"),
+        run=True,
+        epochs=2,
+    )
+
+    assert [candidate.name for candidate in candidates] == ["tau0p50", "crt_sqrt"]
+    assert calls == [
+        ("tau", tmp_path / "fold0_tau0p50.pt", 0.5),
+        ("crt", tmp_path / "fold0_crt_sqrt.pt", "sqrt"),
+    ]
+
+
+def test_parse_args_accepts_rebalance_grid_controls(monkeypatch, tmp_path: Path) -> None:
+    import sys
+
+    from classifier_rebalance_grid import parse_args
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "classifier_rebalance_grid.py",
+            "--checkpoint",
+            "fold0.pt",
+            "--output-dir",
+            str(tmp_path),
+            "--tau",
+            "0.5",
+            "1.0",
+            "--crt-sampler-mode",
+            "sqrt",
+            "class_balanced",
+            "--min-delta-macro-f1",
+            "0.003",
+            "--min-per-class-f1",
+            "0.6",
+        ],
+    )
+
+    args = parse_args()
+
+    assert args.checkpoint == Path("fold0.pt")
+    assert args.output_dir == tmp_path
+    assert args.tau == [0.5, 1.0]
+    assert args.crt_sampler_mode == ["sqrt", "class_balanced"]
+    assert args.min_delta_macro_f1 == 0.003
+    assert args.min_per_class_f1 == 0.6

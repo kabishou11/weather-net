@@ -262,6 +262,36 @@ python3 classifier_rebalance.py \
 
 `--method crt` 会加载已有 checkpoint，冻结 backbone，只训练分类头参数；训练数据会强制沿用 checkpoint 内的 `class_to_idx`，避免重新读 CSV 时类别顺序变化导致标签错位。默认用 `sqrt` 采样在类均衡和原分布之间折中，也可用 `class_balanced` 做更强尾类纠偏。该步骤训练成本很低、推理成本不变，适合在强 backbone 收敛后修正长尾类别决策边界。建议先对单 fold 或 OOF 最差类别对应 fold 快筛，再扩展到所有 fold；若大类 precision 明显下降，则回退到原 checkpoint 或 tau-norm。
 
+自动生成并汇总分类头重平衡网格：
+
+```bash
+python3 classifier_rebalance_grid.py \
+  --checkpoint outputs/convnextv2_384/convnextv2_tiny.fcmae_ft_in22k_in1k_fold0.pt \
+  --output-dir outputs/convnextv2_384/rebalance_grid/fold0 \
+  --tau 0.25 0.5 0.75 1.0 \
+  --crt-sampler-mode sqrt class_balanced \
+  --train-csv data/train.csv \
+  --image-root data/images \
+  --run
+```
+
+跑完候选后，用 `validate.py --output-json` 分别得到 baseline 和候选 metrics，再汇总：
+
+```bash
+python3 classifier_rebalance_grid.py \
+  --checkpoint outputs/convnextv2_384/convnextv2_tiny.fcmae_ft_in22k_in1k_fold0.pt \
+  --output-dir outputs/convnextv2_384/rebalance_grid/fold0 \
+  --tau 0.25 0.5 0.75 1.0 \
+  --crt-sampler-mode sqrt class_balanced \
+  --baseline-metrics outputs/convnextv2_384/rebalance_grid/fold0/baseline_metrics.json \
+  --candidate-metrics outputs/convnextv2_384/rebalance_grid/fold0/tau0p25_metrics.json outputs/convnextv2_384/rebalance_grid/fold0/tau0p50_metrics.json outputs/convnextv2_384/rebalance_grid/fold0/tau0p75_metrics.json outputs/convnextv2_384/rebalance_grid/fold0/tau1p00_metrics.json outputs/convnextv2_384/rebalance_grid/fold0/crt_sqrt_metrics.json outputs/convnextv2_384/rebalance_grid/fold0/crt_class_balanced_metrics.json \
+  --min-delta-macro-f1 0.003 \
+  --min-per-class-f1 0.6 \
+  --tie-epsilon 0.001
+```
+
+汇总会输出 `classifier_rebalance_grid_summary.json/csv`，只有 macro F1 达到增益门槛且最低类 F1 不崩的候选才会被选中。这个门控用于避免在小验证集上被单一高分候选骗过去。
+
 ## 伪标签
 
 对未标注图片生成高置信伪标签：
