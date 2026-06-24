@@ -58,6 +58,23 @@ def test_load_config_accepts_macro_f1_loss_options(tmp_path: Path) -> None:
     assert config.train.sampler_mode == "weighted"
 
 
+def test_load_config_accepts_optimizer_group_options(tmp_path: Path) -> None:
+    from src.weather_net.config import load_config
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "train:\n"
+        "  no_weight_decay: true\n"
+        "  layer_decay: 0.75\n",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert config.train.no_weight_decay is True
+    assert config.train.layer_decay == 0.75
+
+
 def test_load_config_accepts_sample_weighted_sampler_mode(tmp_path: Path) -> None:
     from src.weather_net.config import load_config
 
@@ -228,6 +245,24 @@ def test_load_config_rejects_invalid_class_balanced_beta(tmp_path: Path) -> None
         raise AssertionError("invalid class_balanced_beta should fail during config load")
 
 
+def test_load_config_rejects_invalid_layer_decay(tmp_path: Path) -> None:
+    from src.weather_net.config import load_config
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "train:\n"
+        "  layer_decay: 0.0\n",
+        encoding="utf-8",
+    )
+
+    try:
+        load_config(config_path)
+    except ValueError as error:
+        assert "layer_decay" in str(error)
+    else:
+        raise AssertionError("invalid layer_decay should fail during config load")
+
+
 def test_load_config_rejects_invalid_ldam_options(tmp_path: Path) -> None:
     from src.weather_net.config import load_config
 
@@ -273,6 +308,8 @@ def test_convnextv2_384_config_is_parseable() -> None:
     assert config.model.image_size == 384
     assert config.data.folds == 5
     assert config.train.loss_name == "class_balanced_focal"
+    assert config.train.no_weight_decay is True
+    assert config.train.layer_decay == 0.85
 
 
 def test_convnextv2_384_balanced_softmax_config_is_parseable() -> None:
@@ -285,6 +322,8 @@ def test_convnextv2_384_balanced_softmax_config_is_parseable() -> None:
     assert config.train.loss_name == "balanced_softmax"
     assert config.train.sampler_mode == "auto"
     assert config.train.focal_gamma == 0.0
+    assert config.train.no_weight_decay is True
+    assert config.train.layer_decay == 0.85
 
 
 def test_convnextv2_384_ldam_config_is_parseable() -> None:
@@ -298,6 +337,8 @@ def test_convnextv2_384_ldam_config_is_parseable() -> None:
     assert config.train.ldam_max_margin == 0.5
     assert config.train.ldam_scale == 30.0
     assert config.train.loss_warmup_epochs == 2
+    assert config.train.no_weight_decay is True
+    assert config.train.layer_decay == 0.85
 
 
 def test_convnextv2_384_augmix_jsd_config_is_parseable() -> None:
@@ -310,6 +351,8 @@ def test_convnextv2_384_augmix_jsd_config_is_parseable() -> None:
     assert config.train.jsd_weight == 12.0
     assert config.train.mixup_alpha == 0.0
     assert config.train.cutmix_alpha == 0.0
+    assert config.train.no_weight_decay is True
+    assert config.train.layer_decay == 0.85
 
 
 def test_convnextv2_384_hard_finetune_config_is_parseable() -> None:
@@ -321,3 +364,5 @@ def test_convnextv2_384_hard_finetune_config_is_parseable() -> None:
     assert config.train.sampler_mode == "sample_weighted"
     assert config.train.lr < 0.0002
     assert config.train.epochs == 8
+    assert config.train.no_weight_decay is True
+    assert config.train.layer_decay == 0.85

@@ -229,6 +229,91 @@ def test_make_loaders_sample_weight_usage_both_keeps_sampler_and_loss_weights(tm
     assert train_loader.dataset.rows[1].sample_weight == 2.5
 
 
+def test_build_optimizer_uses_no_decay_for_bias_norm_and_one_dimensional_params() -> None:
+    from torch import nn
+
+    from src.weather_net.training import build_optimizer
+
+    model = nn.Sequential(
+        nn.Conv2d(3, 4, kernel_size=1, bias=True),
+        nn.BatchNorm2d(4),
+        nn.Flatten(),
+        nn.Linear(4, 2, bias=True),
+    )
+
+    optimizer = build_optimizer(
+        model,
+        lr=1e-3,
+        weight_decay=0.05,
+        no_weight_decay=True,
+        layer_decay=1.0,
+    )
+    params_by_decay = {
+        group["weight_decay"]: {id(parameter) for parameter in group["params"]}
+        for group in optimizer.param_groups
+    }
+
+    assert 0.05 in params_by_decay
+    assert 0.0 in params_by_decay
+    assert id(model[0].weight) in params_by_decay[0.05]
+    assert id(model[0].bias) in params_by_decay[0.0]
+    assert id(model[1].weight) in params_by_decay[0.0]
+    assert id(model[1].bias) in params_by_decay[0.0]
+    assert id(model[3].bias) in params_by_decay[0.0]
+
+
+def test_build_optimizer_applies_layer_decay_to_named_backbone_stages() -> None:
+    from torch import nn
+
+    from src.weather_net.training import build_optimizer
+
+    class TinyBackbone(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.stem = nn.Linear(2, 2, bias=False)
+            self.stages = nn.ModuleList(
+                [
+                    nn.Linear(2, 2, bias=False),
+                    nn.Linear(2, 2, bias=False),
+                ]
+            )
+            self.head = nn.Linear(2, 2, bias=False)
+
+    model = TinyBackbone()
+
+    optimizer = build_optimizer(
+        model,
+        lr=1e-3,
+        weight_decay=0.01,
+        no_weight_decay=False,
+        layer_decay=0.5,
+    )
+    lr_by_param = {
+        id(parameter): group["lr"]
+        for group in optimizer.param_groups
+        for parameter in group["params"]
+    }
+
+    assert lr_by_param[id(model.stem.weight)] == 0.000125
+    assert lr_by_param[id(model.stages[0].weight)] == 0.00025
+    assert lr_by_param[id(model.stages[1].weight)] == 0.0005
+    assert lr_by_param[id(model.head.weight)] == 0.001
+
+
+def test_build_optimizer_rejects_invalid_options() -> None:
+    import pytest
+    from torch import nn
+
+    from src.weather_net.training import build_optimizer
+
+    model = nn.Linear(2, 2)
+
+    with pytest.raises(ValueError, match="layer_decay"):
+        build_optimizer(model, lr=1e-3, weight_decay=0.01, layer_decay=0.0)
+    with pytest.raises(ValueError, match="weight_decay"):
+        build_optimizer(model, lr=1e-3, weight_decay=-0.01)
+
+
 def test_weighted_soft_cross_entropy_supports_focal_tail_weighting() -> None:
     from src.weather_net.training import weighted_soft_cross_entropy
 

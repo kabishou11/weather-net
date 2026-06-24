@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import random
+import re
 import time
 from copy import deepcopy
 from dataclasses import replace
@@ -172,6 +173,58 @@ def load_training_manifest(config: AppConfig) -> tuple[list[ManifestRow], dict[s
             label_column=config.data.label_column,
         )
     raise ValueError("Set data.train_dir or data.train_csv")
+
+
+def _decay_layer_id(name: str, head_layer_id: int | None = None) -> int:
+    if name.startswith(("head.", "classifier.", "fc.")) or ".head." in name or ".classifier." in name or ".fc." in name:
+        return 0 if head_layer_id is None else head_layer_id
+    match = re.search(r"(?:^|\.)(?:stages|layers|blocks)\.(\d+)(?:\.|$)", name)
+    if match is not None:
+        return int(match.group(1)) + 1
+    return 0
+
+
+def _uses_weight_decay(name: str, parameter: nn.Parameter, no_weight_decay: bool) -> bool:
+    if not no_weight_decay:
+        return True
+    if parameter.ndim <= 1:
+        return False
+    if name.endswith(".bias"):
+        return False
+    lowered = name.lower()
+    return not any(token in lowered for token in ("norm", "bn", "ln", "bias"))
+
+
+def build_optimizer(
+    model: nn.Module,
+    lr: float,
+    weight_decay: float,
+    no_weight_decay: bool = False,
+    layer_decay: float = 1.0,
+) -> torch.optim.Optimizer:
+    if lr <= 0:
+        raise ValueError("lr must be positive")
+    if weight_decay < 0:
+        raise ValueError("weight_decay must be non-negative")
+    if layer_decay <= 0 or layer_decay > 1:
+        raise ValueError("layer_decay must be in (0, 1]")
+
+    named_parameters = [(name, parameter) for name, parameter in model.named_parameters() if parameter.requires_grad]
+    if not named_parameters:
+        raise ValueError("model has no trainable parameters")
+    backbone_max_layer_id = max(_decay_layer_id(name) for name, _parameter in named_parameters)
+    head_layer_id = backbone_max_layer_id + 1
+    max_layer_id = max(_decay_layer_id(name, head_layer_id=head_layer_id) for name, _parameter in named_parameters)
+    groups: dict[tuple[float, float], dict[str, object]] = {}
+    for name, parameter in named_parameters:
+        layer_id = _decay_layer_id(name, head_layer_id=head_layer_id)
+        group_lr = float(lr) * (float(layer_decay) ** (max_layer_id - layer_id))
+        group_weight_decay = float(weight_decay) if _uses_weight_decay(name, parameter, no_weight_decay) else 0.0
+        key = (group_lr, group_weight_decay)
+        if key not in groups:
+            groups[key] = {"params": [], "lr": group_lr, "weight_decay": group_weight_decay}
+        groups[key]["params"].append(parameter)
+    return torch.optim.AdamW(list(groups.values()), lr=lr, weight_decay=weight_decay)
 
 
 def _one_hot_targets(targets: torch.Tensor, num_classes: int) -> torch.Tensor:
@@ -844,10 +897,12 @@ def train_config(config: AppConfig, device_request: str = "auto") -> list[Path]:
             if config.train.loss_name == "ldam"
             else None
         )
-        optimizer = torch.optim.AdamW(
-            model.parameters(),
+        optimizer = build_optimizer(
+            model,
             lr=config.train.lr,
             weight_decay=config.train.weight_decay,
+            no_weight_decay=config.train.no_weight_decay,
+            layer_decay=config.train.layer_decay,
         )
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer,

@@ -107,3 +107,89 @@ def test_collect_oof_predictions_returns_logits_and_ids(tmp_path) -> None:
     assert [record.image_id for record in records] == ["rain.jpg", "sunny.jpg"]
     assert [record.true_label for record in records] == ["rain", "sunny"]
     assert [list(record.logits) for record in records] == [[2.0, 0.0], [0.0, 2.0]]
+
+
+def test_train_config_passes_optimizer_group_options(monkeypatch, tmp_path) -> None:
+    import torch
+    from torch import nn
+
+    from src.weather_net.config import AppConfig
+    from src.weather_net.data import ManifestRow
+    from src.weather_net.metrics import ClassificationReport
+    from src.weather_net import training
+
+    seen: dict[str, object] = {}
+
+    def fake_manifest(_config):
+        rows = [
+            ManifestRow(path=tmp_path / "rain.jpg", label=0, label_name="rain", image_id="rain.jpg"),
+            ManifestRow(path=tmp_path / "sunny.jpg", label=1, label_name="sunny", image_id="sunny.jpg"),
+        ]
+        return rows, {"rain": 0, "sunny": 1}
+
+    def fake_loaders(train_rows, val_rows, **_kwargs):
+        return object(), object()
+
+    class TinyModel(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.head = nn.Linear(1, 2)
+
+    def fake_create_classifier(*_args, **_kwargs):
+        return TinyModel()
+
+    def fake_build_optimizer(model, lr, weight_decay, no_weight_decay=False, layer_decay=1.0):
+        seen.update(
+            {
+                "model": model,
+                "lr": lr,
+                "weight_decay": weight_decay,
+                "no_weight_decay": no_weight_decay,
+                "layer_decay": layer_decay,
+            }
+        )
+        return torch.optim.SGD(model.parameters(), lr=lr)
+
+    monkeypatch.setattr(training, "load_training_manifest", fake_manifest)
+    monkeypatch.setattr(training, "make_loaders", fake_loaders)
+    monkeypatch.setattr(training, "create_classifier", fake_create_classifier)
+    monkeypatch.setattr(training, "build_optimizer", fake_build_optimizer)
+    monkeypatch.setattr(training, "train_one_epoch", lambda *_args, **_kwargs: 0.1)
+    monkeypatch.setattr(
+        training,
+        "evaluate",
+        lambda *_args, **_kwargs: (
+            ClassificationReport(
+                macro_f1=1.0,
+                accuracy=1.0,
+                per_class_f1={"rain": 1.0, "sunny": 1.0},
+                confusion_matrix=[[1, 0], [0, 1]],
+            ),
+            0.1,
+        ),
+    )
+    monkeypatch.setattr(training, "save_checkpoint", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(training, "collect_oof_predictions", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(training, "write_oof_artifacts", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(training.torch, "load", lambda *_args, **_kwargs: {"model_state": TinyModel().state_dict()})
+
+    class NoopScheduler:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        def step(self) -> None:
+            pass
+
+    monkeypatch.setattr(training.torch.optim.lr_scheduler, "CosineAnnealingLR", NoopScheduler)
+
+    config = AppConfig()
+    config.data.folds = 1
+    config.train.epochs = 1
+    config.train.output_dir = tmp_path / "outputs"
+    config.train.no_weight_decay = True
+    config.train.layer_decay = 0.85
+
+    training.train_config(config, device_request="cpu")
+
+    assert seen["no_weight_decay"] is True
+    assert seen["layer_decay"] == 0.85

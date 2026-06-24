@@ -68,6 +68,8 @@ def _config_to_payload(config) -> dict[str, object]:
             "batch_size": config.train.batch_size,
             "lr": config.train.lr,
             "weight_decay": config.train.weight_decay,
+            "no_weight_decay": config.train.no_weight_decay,
+            "layer_decay": config.train.layer_decay,
             "label_smoothing": config.train.label_smoothing,
             "loss_name": config.train.loss_name,
             "loss_warmup_epochs": config.train.loss_warmup_epochs,
