@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 from collections import Counter
 from pathlib import Path
 from typing import Any
+
+from PIL import Image
 
 from inference_budget import check_inference_budget
 from src.weather_net.config import AppConfig, load_config
@@ -43,6 +46,14 @@ def _count_by_label(rows: list[ManifestRow]) -> dict[str, int]:
     counts: Counter[str] = Counter()
     for row in rows:
         counts[str(row.label_name)] += 1
+    return dict(sorted(counts.items()))
+
+
+def _count_by_label_for_source(rows: list[ManifestRow], source: str) -> dict[str, int]:
+    counts: Counter[str] = Counter()
+    for row in rows:
+        if row.source == source:
+            counts[str(row.label_name)] += 1
     return dict(sorted(counts.items()))
 
 
@@ -162,11 +173,14 @@ def _validate_class_support(
     rows: list[ManifestRow],
     class_to_idx: dict[str, int],
     min_images_per_class: int,
+    min_labeled_images_per_class: int | None = None,
     expected_classes: list[str] | None = None,
     require_all_expected_classes: bool = False,
-) -> dict[str, int]:
+) -> dict[str, object]:
     if min_images_per_class <= 0:
         raise ValueError("min_images_per_class must be positive")
+    if min_labeled_images_per_class is not None and min_labeled_images_per_class <= 0:
+        raise ValueError("min_labeled_images_per_class must be positive")
     if expected_classes is not None:
         expected = list(dict.fromkeys(str(name).strip() for name in expected_classes if str(name).strip()))
         if not expected:
@@ -182,19 +196,55 @@ def _validate_class_support(
     missing = [name for name in idx_to_class(class_to_idx) if label_counts.get(name, 0) < min_images_per_class]
     if missing:
         raise ValueError(f"classes below min_images_per_class={min_images_per_class}: {missing}")
-    return label_counts
+    labeled_counts = _count_by_label_for_source(rows, "labeled")
+    if min_labeled_images_per_class is not None:
+        missing_labeled = [
+            name
+            for name in idx_to_class(class_to_idx)
+            if labeled_counts.get(name, 0) < min_labeled_images_per_class
+        ]
+        if missing_labeled:
+            raise ValueError(
+                "labeled classes below min_labeled_images_per_class="
+                f"{min_labeled_images_per_class}: {missing_labeled}"
+            )
+    return {
+        "all": label_counts,
+        "labeled": labeled_counts,
+    }
+
+
+def _hash_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _validate_image_integrity(
     rows: list[ManifestRow],
     check_image_exists: bool,
+    check_readable_images: bool,
     check_unique_image_id: bool,
     check_unique_realpath: bool,
+    check_unique_image_hash: bool,
 ) -> dict[str, object]:
-    if check_image_exists:
+    requires_existing_files = check_image_exists or check_readable_images or check_unique_image_hash
+    if requires_existing_files:
         missing = [row.image_id or str(row.path) for row in rows if not row.path.exists()]
         if missing:
             raise ValueError(f"missing image files: {missing[:5]}")
+    if check_readable_images:
+        unreadable = []
+        for row in rows:
+            try:
+                with Image.open(row.path) as image:
+                    image.verify()
+            except Exception:
+                unreadable.append(row.image_id or str(row.path))
+        if unreadable:
+            raise ValueError(f"unreadable image files: {unreadable[:5]}")
     if check_unique_image_id:
         ids = [row.image_id for row in rows if row.image_id]
         duplicates = sorted(name for name, count in Counter(ids).items() if count > 1)
@@ -205,10 +255,21 @@ def _validate_image_integrity(
         duplicates = sorted(name for name, count in Counter(realpaths).items() if count > 1)
         if duplicates:
             raise ValueError(f"duplicate real image paths: {duplicates[:5]}")
+    hash_duplicates: list[list[str]] = []
+    if check_unique_image_hash:
+        by_hash: dict[str, list[str]] = {}
+        for row in rows:
+            image_hash = _hash_file(row.path)
+            by_hash.setdefault(image_hash, []).append(row.image_id or str(row.path))
+        hash_duplicates = sorted(values for values in by_hash.values() if len(values) > 1)
+        if hash_duplicates:
+            raise ValueError(f"duplicate image content hashes: {hash_duplicates[:5]}")
     return {
         "checked_exists": check_image_exists,
+        "checked_readable_images": check_readable_images,
         "checked_unique_image_id": check_unique_image_id,
         "checked_unique_realpath": check_unique_realpath,
+        "checked_unique_image_hash": check_unique_image_hash,
     }
 
 
@@ -242,8 +303,10 @@ def run_preflight_checks(
     expected_classes: list[str] | None = None,
     require_all_expected_classes: bool = False,
     check_image_exists: bool = False,
+    check_readable_images: bool = False,
     check_unique_image_id: bool = False,
     check_unique_realpath: bool = False,
+    check_unique_image_hash: bool = False,
     allow_external_data: bool = False,
     external_max_ratio: float | None = None,
     external_max_sample_weight: float | None = None,
@@ -251,6 +314,7 @@ def run_preflight_checks(
     pseudo_max_ratio: float | None = None,
     allow_pseudo_teacher_distillation: bool = False,
     min_images_per_class: int = 1,
+    min_labeled_images_per_class: int | None = None,
     inference_stats: Path | None = None,
     max_seconds_per_image: float | None = None,
     max_checkpoints: int = 1,
@@ -266,14 +330,17 @@ def run_preflight_checks(
         rows,
         class_to_idx,
         min_images_per_class=min_images_per_class,
+        min_labeled_images_per_class=min_labeled_images_per_class,
         expected_classes=expected_classes,
         require_all_expected_classes=require_all_expected_classes,
     )
     image_integrity = _validate_image_integrity(
         rows,
         check_image_exists=check_image_exists,
+        check_readable_images=check_readable_images,
         check_unique_image_id=check_unique_image_id,
         check_unique_realpath=check_unique_realpath,
+        check_unique_image_hash=check_unique_image_hash,
     )
     source_counts = _validate_sources(
         rows,
@@ -303,7 +370,8 @@ def run_preflight_checks(
         "config": str(config_path) if config_path is not None else None,
         "rows": len(rows),
         "classes": idx_to_class(class_to_idx),
-        "label_counts": label_counts,
+        "label_counts": label_counts["all"],
+        "labeled_label_counts": label_counts["labeled"],
         "source_counts": source_counts,
         "image_integrity": image_integrity,
         "teacher_distillation": teacher,
@@ -322,8 +390,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--expected-classes", nargs="+", default=None)
     parser.add_argument("--require-all-expected-classes", action="store_true")
     parser.add_argument("--check-image-exists", action="store_true")
+    parser.add_argument("--check-readable-images", action="store_true")
     parser.add_argument("--check-unique-image-id", action="store_true")
     parser.add_argument("--check-unique-realpath", action="store_true")
+    parser.add_argument("--check-unique-image-hash", action="store_true")
     parser.add_argument("--allow-external-data", action="store_true")
     parser.add_argument("--external-max-ratio", type=float, default=None)
     parser.add_argument("--external-max-sample-weight", type=float, default=None)
@@ -331,6 +401,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pseudo-max-ratio", type=float, default=None)
     parser.add_argument("--allow-pseudo-teacher-distillation", action="store_true")
     parser.add_argument("--min-images-per-class", type=int, default=1)
+    parser.add_argument("--min-labeled-images-per-class", type=int, default=None)
     parser.add_argument("--inference-stats", type=Path, default=None)
     parser.add_argument("--max-seconds-per-image", type=float, default=None)
     parser.add_argument("--max-checkpoints", type=int, default=1)
@@ -350,8 +421,10 @@ def main() -> None:
         expected_classes=args.expected_classes,
         require_all_expected_classes=args.require_all_expected_classes,
         check_image_exists=args.check_image_exists,
+        check_readable_images=args.check_readable_images,
         check_unique_image_id=args.check_unique_image_id,
         check_unique_realpath=args.check_unique_realpath,
+        check_unique_image_hash=args.check_unique_image_hash,
         allow_external_data=args.allow_external_data,
         external_max_ratio=args.external_max_ratio,
         external_max_sample_weight=args.external_max_sample_weight,
@@ -359,6 +432,7 @@ def main() -> None:
         pseudo_max_ratio=args.pseudo_max_ratio,
         allow_pseudo_teacher_distillation=args.allow_pseudo_teacher_distillation,
         min_images_per_class=args.min_images_per_class,
+        min_labeled_images_per_class=args.min_labeled_images_per_class,
         inference_stats=args.inference_stats,
         max_seconds_per_image=args.max_seconds_per_image,
         max_checkpoints=args.max_checkpoints,

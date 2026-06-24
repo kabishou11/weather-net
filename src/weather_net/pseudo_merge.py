@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import csv
+import json
 import math
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -159,6 +161,55 @@ def write_merged_training_csv(output_csv: Path, rows: list[MergedTrainingRow], c
             writer.writerow(values)
 
 
+def _pseudo_teacher_summary(rows: list[MergedTrainingRow], class_names: list[str]) -> dict[str, object]:
+    teacher_rows = [row for row in rows if row.source == "pseudo" and row.teacher_probs is not None]
+    if not teacher_rows:
+        return {
+            "rows": 0,
+            "mean_top1_probability": None,
+            "mean_margin": None,
+        }
+    top1_probabilities: list[float] = []
+    margins: list[float] = []
+    per_class_top1: Counter[str] = Counter()
+    for row in teacher_rows:
+        values = list(row.teacher_probs or ())
+        ranked = sorted(values, reverse=True)
+        top1_idx = max(range(len(values)), key=lambda idx: values[idx])
+        top1_probabilities.append(float(ranked[0]))
+        margins.append(float(ranked[0] - ranked[1]) if len(ranked) > 1 else float(ranked[0]))
+        per_class_top1[class_names[top1_idx]] += 1
+    return {
+        "rows": len(teacher_rows),
+        "mean_top1_probability": sum(top1_probabilities) / len(top1_probabilities),
+        "mean_margin": sum(margins) / len(margins),
+        "top1_per_class": dict(sorted(per_class_top1.items())),
+    }
+
+
+def write_merge_audit_json(
+    audit_json: Path,
+    rows: list[MergedTrainingRow],
+    class_names: list[str],
+    stats: dict[str, int],
+    min_confidence: float,
+    allow_pseudo_teacher: bool,
+) -> None:
+    pseudo_counts = Counter(row.label for row in rows if row.source == "pseudo")
+    source_counts = Counter(row.source for row in rows)
+    audit = {
+        "stats": stats,
+        "class_names": class_names,
+        "source_counts": dict(sorted(source_counts.items())),
+        "pseudo_per_class": dict(sorted(pseudo_counts.items())),
+        "min_confidence": min_confidence,
+        "allow_pseudo_teacher": allow_pseudo_teacher,
+        "pseudo_teacher": _pseudo_teacher_summary(rows, class_names),
+    }
+    audit_json.parent.mkdir(parents=True, exist_ok=True)
+    audit_json.write_text(json.dumps(audit, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
 def merge_training_with_pseudo_labels(
     train_dir: Path | None,
     train_csv: Path | None,
@@ -168,6 +219,7 @@ def merge_training_with_pseudo_labels(
     output_csv: Path,
     min_confidence: float,
     allow_pseudo_teacher: bool = False,
+    audit_json: Path | None = None,
 ) -> dict[str, int]:
     labeled_rows, class_names = _load_labeled_rows(train_dir=train_dir, train_csv=train_csv, image_root=image_root)
     pseudo_rows = _read_pseudo_rows(
@@ -202,7 +254,7 @@ def merge_training_with_pseudo_labels(
             for row in merged_rows
         ]
     write_merged_training_csv(output_csv, merged_rows, class_names=class_names)
-    return {
+    stats = {
         "labeled": len(labeled_rows),
         "pseudo": len(deduped_pseudo_rows),
         "total": len(merged_rows),
@@ -210,3 +262,13 @@ def merge_training_with_pseudo_labels(
         "skipped_labeled_duplicates": skipped_labeled_duplicates,
         "skipped_duplicate_pseudo": skipped_duplicate_pseudo,
     }
+    if audit_json is not None:
+        write_merge_audit_json(
+            audit_json=audit_json,
+            rows=merged_rows,
+            class_names=class_names,
+            stats=stats,
+            min_confidence=min_confidence,
+            allow_pseudo_teacher=allow_pseudo_teacher,
+        )
+    return stats

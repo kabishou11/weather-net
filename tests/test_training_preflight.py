@@ -177,6 +177,100 @@ def test_preflight_rejects_missing_images_and_duplicate_ids(tmp_path: Path) -> N
         )
 
 
+def test_preflight_rejects_unreadable_images_when_requested(tmp_path: Path) -> None:
+    from training_preflight import run_preflight_checks
+
+    _make_image(tmp_path / "images" / "rain.jpg")
+    bad_image = tmp_path / "images" / "bad.jpg"
+    bad_image.parent.mkdir(parents=True, exist_ok=True)
+    bad_image.write_bytes(b"not an image")
+    train_csv = tmp_path / "train.csv"
+    train_csv.write_text(
+        "image,label\n"
+        "rain.jpg,rain\n"
+        "bad.jpg,rain\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="unreadable image files"):
+        run_preflight_checks(
+            config_path=Path("configs/convnext_tiny.yaml"),
+            train_csv=train_csv,
+            image_root=tmp_path / "images",
+            check_readable_images=True,
+        )
+
+
+def test_preflight_rejects_duplicate_content_hash_across_sources(tmp_path: Path) -> None:
+    from training_preflight import run_preflight_checks
+
+    _make_image(tmp_path / "images" / "labeled.jpg")
+    _make_image(tmp_path / "images" / "pseudo_copy.jpg")
+    (tmp_path / "images" / "pseudo_copy.jpg").write_bytes((tmp_path / "images" / "labeled.jpg").read_bytes())
+    train_csv = tmp_path / "train.csv"
+    train_csv.write_text(
+        "image,label,source,confidence\n"
+        "labeled.jpg,rain,labeled,1.0\n"
+        "pseudo_copy.jpg,rain,pseudo,0.97\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="duplicate image content hashes"):
+        run_preflight_checks(
+            config_path=Path("configs/convnext_tiny.yaml"),
+            train_csv=train_csv,
+            image_root=tmp_path / "images",
+            check_unique_image_hash=True,
+            pseudo_min_confidence=0.95,
+            pseudo_max_ratio=1.0,
+        )
+
+
+def test_preflight_hash_check_reports_missing_images_cleanly(tmp_path: Path) -> None:
+    from training_preflight import run_preflight_checks
+
+    train_csv = tmp_path / "train.csv"
+    train_csv.write_text(
+        "image,label\n"
+        "missing.jpg,rain\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="missing image files"):
+        run_preflight_checks(
+            config_path=Path("configs/convnext_tiny.yaml"),
+            train_csv=train_csv,
+            image_root=tmp_path / "images",
+            check_unique_image_hash=True,
+        )
+
+
+def test_preflight_rejects_low_labeled_class_support_even_when_pseudo_exists(tmp_path: Path) -> None:
+    from training_preflight import run_preflight_checks
+
+    _make_image(tmp_path / "images" / "rain_labeled.jpg")
+    _make_image(tmp_path / "images" / "rain_pseudo.jpg")
+    _make_image(tmp_path / "images" / "sunny_pseudo.jpg")
+    train_csv = tmp_path / "train.csv"
+    train_csv.write_text(
+        "image,label,source,confidence\n"
+        "rain_labeled.jpg,rain,labeled,1.0\n"
+        "rain_pseudo.jpg,rain,pseudo,0.98\n"
+        "sunny_pseudo.jpg,sunny,pseudo,0.98\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="labeled classes below min_labeled_images_per_class"):
+        run_preflight_checks(
+            config_path=Path("configs/convnext_tiny.yaml"),
+            train_csv=train_csv,
+            image_root=tmp_path / "images",
+            min_labeled_images_per_class=1,
+            pseudo_min_confidence=0.95,
+            pseudo_max_ratio=2.0,
+        )
+
+
 def test_preflight_rejects_external_ratio_or_weight_above_gate(tmp_path: Path) -> None:
     import pytest
 

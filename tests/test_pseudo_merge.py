@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import json
 import pytest
 from PIL import Image
 
@@ -334,6 +335,45 @@ def test_merge_preserves_labeled_soft_teacher_columns_when_allowed(tmp_path: Pat
         f"{tmp_path / 'images' / 'sunny.jpg'},sunny,labeled,1.000000,1.000000,0.07000000,0.93000000\n"
         f"{tmp_path / 'images' / 'pseudo.jpg'},rain,pseudo,0.970000,0.979000,0.91000000,0.09000000\n"
     )
+
+
+def test_merge_writes_pseudo_teacher_audit_json(tmp_path: Path) -> None:
+    from src.weather_net.pseudo_merge import merge_training_with_pseudo_labels
+
+    _make_image(tmp_path / "images" / "rain.jpg")
+    _make_image(tmp_path / "images" / "sunny.jpg")
+    _make_image(tmp_path / "images" / "pseudo_rain.jpg")
+    _make_image(tmp_path / "images" / "pseudo_sunny.jpg")
+    train_csv = tmp_path / "train.csv"
+    train_csv.write_text("image,label\nrain.jpg,rain\nsunny.jpg,sunny\n", encoding="utf-8")
+    pseudo_csv = tmp_path / "pseudo.csv"
+    pseudo_csv.write_text(
+        "image,label,confidence,teacher_rain,teacher_sunny\n"
+        "pseudo_rain.jpg,rain,0.970000,0.91,0.09\n"
+        "pseudo_sunny.jpg,sunny,0.980000,0.12,0.88\n",
+        encoding="utf-8",
+    )
+
+    audit_json = tmp_path / "merge_audit.json"
+    stats = merge_training_with_pseudo_labels(
+        train_dir=None,
+        train_csv=train_csv,
+        image_root=tmp_path / "images",
+        pseudo_csv=pseudo_csv,
+        pseudo_image_root=tmp_path / "images",
+        output_csv=tmp_path / "merged.csv",
+        min_confidence=0.95,
+        allow_pseudo_teacher=True,
+        audit_json=audit_json,
+    )
+
+    audit = json.loads(audit_json.read_text(encoding="utf-8"))
+    assert audit["stats"] == stats
+    assert audit["class_names"] == ["rain", "sunny"]
+    assert audit["pseudo_per_class"] == {"rain": 1, "sunny": 1}
+    assert audit["pseudo_teacher"]["rows"] == 2
+    assert audit["pseudo_teacher"]["mean_top1_probability"] == pytest.approx(0.895)
+    assert audit["pseudo_teacher"]["mean_margin"] == pytest.approx(0.79)
 
 
 def test_merge_rejects_extra_pseudo_teacher_class(tmp_path: Path) -> None:

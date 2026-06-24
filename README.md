@@ -406,10 +406,11 @@ python3 merge_pseudo_labels.py \
   --pseudo-image-root data/unlabeled \
   --min-confidence 0.95 \
   --allow-pseudo-teacher \
+  --audit-json outputs/pseudo/merged_teacher_pseudo_audit.json \
   --output data/merged_teacher_pseudo.csv
 ```
 
-启用后会要求伪标签 teacher 概率覆盖全部类别、非负有限、和为 1，且 teacher top-1 必须和伪标签类别一致；真实标注行若已有 OOF soft teacher 会原样保留，否则补 one-hot teacher，保证蒸馏训练每行都有完整 soft target。
+启用后会要求伪标签 teacher 概率覆盖全部类别、非负有限、和为 1，且 teacher top-1 必须和伪标签类别一致；真实标注行若已有 OOF soft teacher 会原样保留，否则补 one-hot teacher，保证蒸馏训练每行都有完整 soft target。`--audit-json` 会记录每类伪标签数量、teacher top-1 概率和 margin，用于训练前判断伪标签是否偏科或置信度虚高。
 
 用合并后的 CSV 再训练：
 
@@ -528,9 +529,12 @@ python3 training_preflight.py \
   --image-root data/images \
   --class-map outputs/convnextv2_384/class_to_idx.json \
   --check-image-exists \
+  --check-readable-images \
   --check-unique-image-id \
   --check-unique-realpath \
+  --check-unique-image-hash \
   --min-images-per-class 2 \
+  --min-labeled-images-per-class 2 \
   --output outputs/preflight_train.json
 ```
 
@@ -541,7 +545,13 @@ python3 training_preflight.py \
   --config configs/convnextv2_384.yaml \
   --train-csv data/train_with_external.csv \
   --image-root data/images \
-  --allow-external-data
+  --check-image-exists \
+  --check-readable-images \
+  --check-unique-image-hash \
+  --allow-external-data \
+  --external-max-ratio 0.3 \
+  --external-max-sample-weight 0.5 \
+  --min-labeled-images-per-class 2
 ```
 
 如果训练 CSV 包含 `source=pseudo`，建议把伪标签置信度和数量比例设成硬门槛：
@@ -551,8 +561,14 @@ python3 training_preflight.py \
   --config configs/convnextv2_384.yaml \
   --train-csv data/merged_train.csv \
   --image-root data/images \
+  --check-image-exists \
+  --check-readable-images \
+  --check-unique-image-id \
+  --check-unique-realpath \
+  --check-unique-image-hash \
   --pseudo-min-confidence 0.95 \
-  --pseudo-max-ratio 0.5
+  --pseudo-max-ratio 0.5 \
+  --min-labeled-images-per-class 2
 ```
 
 如果已经有 `infer.py` 生成的 `.stats.json`，可把推理时间也纳入同一个 gate：
@@ -567,7 +583,7 @@ python3 training_preflight.py \
   --max-checkpoints 1
 ```
 
-当 `train.distillation_alpha > 0` 时，preflight 会要求每一行都有完整 `teacher_{class_name}` 概率列，并默认要求 teacher 训练 CSV 只包含真实标注行。若要训练 Noisy Student 伪标签 teacher CSV，必须显式加 `--allow-pseudo-teacher-distillation`，并同时设置 `--pseudo-min-confidence` 与 `--pseudo-max-ratio`。`--train-csv` 和 `--train-dir` 不能同时设置；当外部数据未显式允许、伪标签低于门槛、某类样本低于门槛、推理 stats 超预算或 TTA 未被允许时，会直接失败。
+当 `train.distillation_alpha > 0` 时，preflight 会要求每一行都有完整 `teacher_{class_name}` 概率列，并默认要求 teacher 训练 CSV 只包含真实标注行。若要训练 Noisy Student 伪标签 teacher CSV，必须显式加 `--allow-pseudo-teacher-distillation`，并同时设置 `--pseudo-min-confidence` 与 `--pseudo-max-ratio`。`--check-readable-images` 会用 PIL 发现坏图，`--check-unique-image-hash` 会按 SHA256 拦截跨来源重复图，`--min-labeled-images-per-class` 会要求每个官方类别都有足够真实标注样本，不能靠 pseudo/external 补齐验证支撑。`--train-csv` 和 `--train-dir` 不能同时设置；当外部数据未显式允许、伪标签低于门槛、某类样本低于门槛、推理 stats 超预算或 TTA 未被允许时，会直接失败。
 
 ## 四天冲分顺序
 
