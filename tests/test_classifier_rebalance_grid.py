@@ -10,6 +10,7 @@ def test_build_rebalance_grid_generates_tau_and_crt_candidates(tmp_path: Path) -
         output_dir=tmp_path,
         tau_values=[0.5, 1.0],
         crt_sampler_modes=["sqrt", "class_balanced"],
+        lws_sampler_modes=["sqrt"],
     )
 
     assert [candidate.name for candidate in candidates] == [
@@ -17,11 +18,35 @@ def test_build_rebalance_grid_generates_tau_and_crt_candidates(tmp_path: Path) -
         "tau1p00",
         "crt_sqrt",
         "crt_class_balanced",
+        "lws_sqrt",
     ]
     assert candidates[0].method == "tau_norm"
     assert candidates[0].output == tmp_path / "fold0_tau0p50.pt"
     assert candidates[2].method == "crt"
     assert candidates[2].sampler_mode == "sqrt"
+    assert candidates[4].method == "lws"
+    assert candidates[4].output == tmp_path / "fold0_lws_sqrt.pt"
+
+
+def test_build_rebalance_grid_rejects_duplicate_candidate_names(tmp_path: Path) -> None:
+    import pytest
+
+    from classifier_rebalance_grid import build_rebalance_grid
+
+    with pytest.raises(ValueError, match="duplicate"):
+        build_rebalance_grid(
+            checkpoint=Path("fold0.pt"),
+            output_dir=tmp_path,
+            tau_values=[0.124, 0.12],
+            crt_sampler_modes=[],
+        )
+    with pytest.raises(ValueError, match="duplicate"):
+        build_rebalance_grid(
+            checkpoint=Path("fold0.pt"),
+            output_dir=tmp_path,
+            tau_values=[],
+            crt_sampler_modes=["sqrt", "sqrt"],
+        )
 
 
 def test_summarize_rebalance_grid_selects_stable_macro_f1_winner(tmp_path: Path) -> None:
@@ -75,14 +100,21 @@ def test_run_rebalance_grid_dispatches_tau_and_crt(monkeypatch, tmp_path: Path) 
     import classifier_rebalance_grid
     from classifier_rebalance_grid import run_rebalance_grid
 
-    calls: list[tuple[str, Path, object]] = []
+    calls: list[tuple[str, Path, object, object]] = []
 
-    def fake_tau(checkpoint, output, tau):
-        calls.append(("tau", output, tau))
+    def fake_tau(checkpoint, output, tau, head_key="auto"):
+        calls.append(("tau", output, tau, head_key))
         return {"output": str(output)}
 
     def fake_crt(**kwargs):
-        calls.append(("crt", kwargs["output_path"], kwargs["sampler_mode"]))
+        calls.append(
+            (
+                kwargs.get("rebalance_method", "crt"),
+                kwargs["output_path"],
+                kwargs["sampler_mode"],
+                kwargs["head_prefix"],
+            )
+        )
         return {"output": str(kwargs["output_path"])}
 
     monkeypatch.setattr(classifier_rebalance_grid, "rebalance_checkpoint", fake_tau)
@@ -93,15 +125,19 @@ def test_run_rebalance_grid_dispatches_tau_and_crt(monkeypatch, tmp_path: Path) 
         output_dir=tmp_path,
         tau_values=[0.5],
         crt_sampler_modes=["sqrt"],
+        lws_sampler_modes=["sqrt"],
         train_csv=Path("train.csv"),
         run=True,
         epochs=2,
+        head_key="head.fc.weight",
+        head_prefix="head.fc",
     )
 
-    assert [candidate.name for candidate in candidates] == ["tau0p50", "crt_sqrt"]
+    assert [candidate.name for candidate in candidates] == ["tau0p50", "crt_sqrt", "lws_sqrt"]
     assert calls == [
-        ("tau", tmp_path / "fold0_tau0p50.pt", 0.5),
-        ("crt", tmp_path / "fold0_crt_sqrt.pt", "sqrt"),
+        ("tau", tmp_path / "fold0_tau0p50.pt", 0.5, "head.fc.weight"),
+        ("crt", tmp_path / "fold0_crt_sqrt.pt", "sqrt", "head.fc"),
+        ("lws", tmp_path / "fold0_lws_sqrt.pt", "sqrt", "head.fc"),
     ]
 
 
@@ -127,6 +163,7 @@ def test_validate_rebalance_grid_writes_baseline_and_candidate_metrics(monkeypat
         output_dir=tmp_path,
         tau_values=[0.5],
         crt_sampler_modes=["sqrt"],
+        lws_sampler_modes=[],
     )
 
     baseline = validate_rebalance_grid(
@@ -169,6 +206,12 @@ def test_parse_args_accepts_rebalance_grid_controls(monkeypatch, tmp_path: Path)
             "--crt-sampler-mode",
             "sqrt",
             "class_balanced",
+            "--lws-sampler-mode",
+            "sqrt",
+            "--head-key",
+            "head.fc.weight",
+            "--head-prefix",
+            "head.fc",
             "--validate",
             "--val-csv",
             "val.csv",
@@ -189,6 +232,9 @@ def test_parse_args_accepts_rebalance_grid_controls(monkeypatch, tmp_path: Path)
     assert args.output_dir == tmp_path
     assert args.tau == [0.5, 1.0]
     assert args.crt_sampler_mode == ["sqrt", "class_balanced"]
+    assert args.lws_sampler_mode == ["sqrt"]
+    assert args.head_key == "head.fc.weight"
+    assert args.head_prefix == "head.fc"
     assert args.validate is True
     assert args.val_csv == Path("val.csv")
     assert args.val_image_root == Path("images")

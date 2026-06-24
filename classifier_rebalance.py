@@ -19,10 +19,43 @@ HEAD_KEY_CANDIDATES = (
     "classifier.weight",
     "head.weight",
     "fc.weight",
+    "head.fc.weight",
+    "head.classifier.weight",
+    "context_head.weight",
     "module.classifier.weight",
     "module.head.weight",
     "module.fc.weight",
+    "module.head.fc.weight",
+    "module.head.classifier.weight",
+    "module.context_head.weight",
 )
+
+
+def _bias_key_for_head_key(head_key: str) -> str:
+    if not head_key.endswith(".weight"):
+        raise ValueError("classifier head key must end with .weight")
+    return f"{head_key[:-len('.weight')]}.bias"
+
+
+def _resolve_head_weight_key_from_prefix(state_dict: Mapping[str, torch.Tensor], head_prefix: str) -> str:
+    if head_prefix == "auto":
+        return _resolve_head_key(state_dict, "auto")
+    if head_prefix.endswith(".weight"):
+        return _resolve_head_key(state_dict, head_prefix)
+    return _resolve_head_key(state_dict, f"{head_prefix}.weight")
+
+
+def validate_class_to_idx(class_to_idx: Mapping[str, int]) -> dict[str, int]:
+    mapping = {str(key): int(value) for key, value in class_to_idx.items()}
+    values = sorted(mapping.values())
+    if values != list(range(len(values))):
+        raise ValueError("class_to_idx must use contiguous unique ids from 0")
+    return mapping
+
+
+def class_names_from_mapping(class_to_idx: Mapping[str, int]) -> list[str]:
+    mapping = validate_class_to_idx(class_to_idx)
+    return [name for name, _idx in sorted(mapping.items(), key=lambda item: item[1])]
 
 
 def freeze_backbone_for_classifier_retraining(model: torch.nn.Module, head_prefix: str = "auto") -> list[str]:
@@ -132,7 +165,7 @@ def _resolve_head_key(state_dict: Mapping[str, torch.Tensor], head_key: str) -> 
     suffix_matches = [
         key
         for key, value in state_dict.items()
-        if key.endswith((".classifier.weight", ".head.weight", ".fc.weight"))
+        if key.endswith((".classifier.weight", ".head.weight", ".fc.weight", ".head.fc.weight", ".head.classifier.weight"))
         and isinstance(value, torch.Tensor)
         and value.ndim == 2
     ]
@@ -161,6 +194,70 @@ def apply_tau_norm_to_state_dict(
     norms = weight.float().norm(dim=1, keepdim=True).clamp_min(eps)
     output[resolved_key] = (weight.float() / norms.pow(float(tau))).to(dtype=weight.dtype)
     return output
+
+
+def fold_lws_into_state_dict(
+    state_dict: Mapping[str, torch.Tensor],
+    log_scales: torch.Tensor,
+    head_key: str = "auto",
+    min_scale: float = 0.25,
+    max_scale: float = 4.0,
+) -> dict[str, torch.Tensor]:
+    if min_scale <= 0 or max_scale <= 0 or min_scale > max_scale:
+        raise ValueError("LWS scale range must be positive and ordered")
+    resolved_key = _resolve_head_key(state_dict, head_key)
+    weight = state_dict[resolved_key]
+    if not isinstance(weight, torch.Tensor) or weight.ndim != 2:
+        raise ValueError("classifier head weight must be a 2D tensor")
+    if log_scales.ndim != 1 or log_scales.numel() != weight.shape[0]:
+        raise ValueError("log_scales must have one value per class")
+    scales = log_scales.detach().to(device=weight.device, dtype=torch.float32).exp().view(-1, 1)
+    if not torch.isfinite(scales).all():
+        raise ValueError("LWS scales must be finite")
+    if float(scales.min()) < min_scale or float(scales.max()) > max_scale:
+        raise ValueError(f"LWS scales outside allowed range [{min_scale}, {max_scale}]")
+    output = {key: value.clone() if isinstance(value, torch.Tensor) else value for key, value in state_dict.items()}
+    output[resolved_key] = (weight.float() * scales).to(dtype=weight.dtype)
+    bias_key = _bias_key_for_head_key(resolved_key)
+    bias = state_dict.get(bias_key)
+    if isinstance(bias, torch.Tensor):
+        output[bias_key] = (bias.float() * scales.flatten()).to(dtype=bias.dtype)
+    if any(isinstance(value, torch.Tensor) and not torch.isfinite(value).all() for value in output.values()):
+        raise ValueError("folded LWS checkpoint contains non-finite tensors")
+    return output
+
+
+def freeze_all_model_parameters(model: torch.nn.Module) -> None:
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+
+
+def train_lws_one_epoch(
+    model: torch.nn.Module,
+    loader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    device: str,
+    lws_log_scales: torch.nn.Parameter,
+) -> float:
+    model.eval()
+    criterion = torch.nn.CrossEntropyLoss(reduction="none")
+    total_loss = 0.0
+    total_items = 0
+    for images, targets, sample_weights in loader:
+        images = images.to(device, non_blocking=True)
+        targets = targets.to(device, non_blocking=True)
+        sample_weights = sample_weights.to(device, non_blocking=True)
+        optimizer.zero_grad(set_to_none=True)
+        with torch.no_grad():
+            base_logits = model(images)
+        logits = base_logits * lws_log_scales.exp().view(1, -1)
+        losses = criterion(logits, targets)
+        loss = (losses * sample_weights).sum() / sample_weights.sum().clamp_min(1e-8)
+        loss.backward()
+        optimizer.step()
+        total_loss += float(loss.detach().cpu()) * images.size(0)
+        total_items += images.size(0)
+    return total_loss / max(1, total_items)
 
 
 def rebalance_checkpoint(
@@ -213,7 +310,10 @@ def retrain_classifier_head(
     num_workers: int = 2,
     transform_backend: str = "auto",
     amp: bool = False,
+    rebalance_method: str = "crt",
 ) -> dict[str, object]:
+    if rebalance_method not in {"crt", "lws"}:
+        raise ValueError("rebalance_method must be one of: crt, lws")
     if epochs <= 0:
         raise ValueError("epochs must be positive")
     if batch_size <= 0:
@@ -227,7 +327,7 @@ def retrain_classifier_head(
     checkpoint = torch.load(checkpoint_path, map_location=device)
     if "model_state" not in checkpoint or "class_to_idx" not in checkpoint:
         raise ValueError("checkpoint must contain model_state and class_to_idx")
-    class_to_idx = {str(key): int(value) for key, value in checkpoint["class_to_idx"].items()}
+    class_to_idx = validate_class_to_idx(checkpoint["class_to_idx"])
     model_name = str(checkpoint.get("model_name", "convnext_tiny"))
     image_size = int(checkpoint.get("image_size", 224))
     model = create_classifier(
@@ -237,7 +337,15 @@ def retrain_classifier_head(
     )
     model.load_state_dict(checkpoint["model_state"])
     model.to(device)
-    trainable = freeze_backbone_for_classifier_retraining(model, head_prefix=head_prefix)
+    if rebalance_method == "lws":
+        freeze_all_model_parameters(model)
+        trainable: list[str] = []
+        state_keys = {name: parameter for name, parameter in model.named_parameters()}
+        resolved_head_key = _resolve_head_weight_key_from_prefix(state_keys, head_prefix)
+    else:
+        trainable = freeze_backbone_for_classifier_retraining(model, head_prefix=head_prefix)
+        state_keys = {name: parameter for name, parameter in model.named_parameters()}
+        resolved_head_key = _resolve_head_weight_key_from_prefix(state_keys, head_prefix)
     rows = load_training_manifest_from_args(
         train_csv=train_csv,
         train_dir=train_dir,
@@ -252,48 +360,85 @@ def retrain_classifier_head(
         sampler_mode=sampler_mode,
         transform_backend=transform_backend,
     )
-    optimizer = torch.optim.AdamW(
-        [parameter for parameter in model.parameters() if parameter.requires_grad],
-        lr=lr,
-        weight_decay=weight_decay,
-    )
-    scaler = torch.amp.GradScaler("cuda", enabled=amp and device == "cuda")
+    if rebalance_method == "lws":
+        lws_log_scales = torch.nn.Parameter(torch.zeros(len(class_to_idx), device=device))
+        optimizer = torch.optim.AdamW([lws_log_scales], lr=lr, weight_decay=weight_decay)
+        scaler = None
+    else:
+        lws_log_scales = None
+        optimizer = torch.optim.AdamW(
+            [parameter for parameter in model.parameters() if parameter.requires_grad],
+            lr=lr,
+            weight_decay=weight_decay,
+        )
+        scaler = torch.amp.GradScaler("cuda", enabled=amp and device == "cuda")
     losses: list[float] = []
     for epoch in range(1, epochs + 1):
-        loss = train_one_epoch(
-            model,
-            loader,
-            optimizer,
-            scaler,
-            device=device,
-            num_classes=len(class_to_idx),
-            label_smoothing=0.0,
-            mixup_alpha=0.0,
-            cutmix_alpha=0.0,
-            amp=amp,
-            loss_name="ce",
-            epoch=epoch,
-        )
+        if rebalance_method == "lws":
+            assert lws_log_scales is not None
+            loss = train_lws_one_epoch(
+                model,
+                loader,
+                optimizer,
+                device=device,
+                lws_log_scales=lws_log_scales,
+            )
+        else:
+            assert scaler is not None
+            loss = train_one_epoch(
+                model,
+                loader,
+                optimizer,
+                scaler,
+                device=device,
+                num_classes=len(class_to_idx),
+                label_smoothing=0.0,
+                mixup_alpha=0.0,
+                cutmix_alpha=0.0,
+                amp=amp,
+                loss_name="ce",
+                epoch=epoch,
+            )
         losses.append(float(loss))
     output_checkpoint = dict(checkpoint)
-    output_checkpoint["model_state"] = model.state_dict()
+    if rebalance_method == "lws":
+        assert lws_log_scales is not None
+        output_checkpoint["model_state"] = fold_lws_into_state_dict(
+            model.state_dict(),
+            log_scales=lws_log_scales.detach().cpu(),
+            head_key=resolved_head_key,
+        )
+        learned_scales = [float(value) for value in lws_log_scales.detach().cpu().exp().tolist()]
+        scale_by_class = dict(zip(class_names_from_mapping(class_to_idx), learned_scales))
+    else:
+        output_checkpoint["model_state"] = model.state_dict()
+        learned_scales = None
+        scale_by_class = None
     output_checkpoint["rebalance"] = {
-        "method": "crt",
+        "method": rebalance_method,
         "epochs": int(epochs),
         "lr": float(lr),
         "weight_decay": float(weight_decay),
         "sampler_mode": sampler_mode,
         "trainable": trainable,
+        "head_key": resolved_head_key,
         "source_checkpoint": str(checkpoint_path),
     }
+    if learned_scales is not None:
+        output_checkpoint["rebalance"]["scales"] = learned_scales
+        output_checkpoint["rebalance"]["scale_by_class"] = scale_by_class
+        output_checkpoint["rebalance"]["scales_folded_into"] = "weight_and_bias"
     output_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(output_checkpoint, output_path)
     return {
-        "method": "crt",
+        "method": rebalance_method,
         "epochs": int(epochs),
         "lr": float(lr),
         "sampler_mode": sampler_mode,
         "trainable": trainable,
+        "head_key": resolved_head_key,
+        "scales": learned_scales,
+        "scale_by_class": scale_by_class,
         "losses": losses,
         "source": str(checkpoint_path),
         "output": str(output_path),
@@ -304,7 +449,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Apply classifier rebalancing to a trained checkpoint.")
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--method", choices=["tau_norm", "crt"], default="tau_norm")
+    parser.add_argument("--method", choices=["tau_norm", "crt", "lws"], default="tau_norm")
     parser.add_argument("--tau", type=float, default=1.0)
     parser.add_argument("--head-key", type=str, default="auto")
     parser.add_argument("--map-location", type=str, default="cpu")
@@ -351,6 +496,7 @@ def main() -> None:
             num_workers=args.num_workers,
             transform_backend=args.transform_backend,
             amp=args.amp,
+            rebalance_method=args.method,
         )
     print(json.dumps(summary, indent=2, ensure_ascii=False))
 

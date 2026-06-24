@@ -26,11 +26,21 @@ def _tau_name(value: float) -> str:
     return f"tau{value:.2f}".replace(".", "p")
 
 
+def _validate_unique_candidates(candidates: Sequence[RebalanceCandidate]) -> None:
+    names = [candidate.name for candidate in candidates]
+    outputs = [candidate.output for candidate in candidates]
+    if len(set(names)) != len(names):
+        raise ValueError("duplicate rebalance candidate names generated")
+    if len(set(outputs)) != len(outputs):
+        raise ValueError("duplicate rebalance candidate outputs generated")
+
+
 def build_rebalance_grid(
     checkpoint: Path,
     output_dir: Path,
     tau_values: Sequence[float],
     crt_sampler_modes: Sequence[str],
+    lws_sampler_modes: Sequence[str] = (),
 ) -> list[RebalanceCandidate]:
     output_dir.mkdir(parents=True, exist_ok=True)
     stem = checkpoint.stem
@@ -63,6 +73,20 @@ def build_rebalance_grid(
                 sampler_mode=sampler_mode,
             )
         )
+    for sampler_mode in lws_sampler_modes:
+        if sampler_mode not in valid_sampler_modes:
+            raise ValueError("lws sampler modes must be one of: none, sqrt, class_balanced")
+        name = f"lws_{sampler_mode}"
+        candidates.append(
+            RebalanceCandidate(
+                name=name,
+                method="lws",
+                checkpoint=checkpoint,
+                output=output_dir / f"{stem}_{name}.pt",
+                sampler_mode=sampler_mode,
+            )
+        )
+    _validate_unique_candidates(candidates)
     return candidates
 
 
@@ -176,6 +200,7 @@ def run_rebalance_grid(
     output_dir: Path,
     tau_values: Sequence[float],
     crt_sampler_modes: Sequence[str],
+    lws_sampler_modes: Sequence[str] = (),
     train_csv: Path | None = None,
     train_dir: Path | None = None,
     image_root: Path | None = None,
@@ -184,14 +209,16 @@ def run_rebalance_grid(
     batch_size: int = 32,
     lr: float = 1e-3,
     device: str = "auto",
+    head_key: str = "auto",
+    head_prefix: str = "auto",
 ) -> list[RebalanceCandidate]:
-    candidates = build_rebalance_grid(checkpoint, output_dir, tau_values, crt_sampler_modes)
+    candidates = build_rebalance_grid(checkpoint, output_dir, tau_values, crt_sampler_modes, lws_sampler_modes)
     if not run:
         return candidates
     for candidate in candidates:
         if candidate.method == "tau_norm":
             assert candidate.tau is not None
-            rebalance_checkpoint(checkpoint, candidate.output, tau=candidate.tau)
+            rebalance_checkpoint(checkpoint, candidate.output, tau=candidate.tau, head_key=head_key)
         elif candidate.method == "crt":
             retrain_classifier_head(
                 checkpoint_path=checkpoint,
@@ -204,6 +231,22 @@ def run_rebalance_grid(
                 lr=lr,
                 sampler_mode=str(candidate.sampler_mode),
                 device=device,
+                head_prefix=head_prefix,
+            )
+        elif candidate.method == "lws":
+            retrain_classifier_head(
+                checkpoint_path=checkpoint,
+                output_path=candidate.output,
+                train_csv=train_csv,
+                train_dir=train_dir,
+                image_root=image_root,
+                epochs=epochs,
+                batch_size=batch_size,
+                lr=lr,
+                sampler_mode=str(candidate.sampler_mode),
+                device=device,
+                head_prefix=head_prefix,
+                rebalance_method="lws",
             )
     return candidates
 
@@ -271,6 +314,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--tau", type=float, nargs="*", default=[0.25, 0.5, 0.75, 1.0])
     parser.add_argument("--crt-sampler-mode", nargs="*", default=["sqrt", "class_balanced"])
+    parser.add_argument("--lws-sampler-mode", nargs="*", default=[])
     parser.add_argument("--train-csv", type=Path, default=None)
     parser.add_argument("--train-dir", type=Path, default=None)
     parser.add_argument("--image-root", type=Path, default=None)
@@ -279,6 +323,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--device", type=str, default="auto")
+    parser.add_argument("--head-key", type=str, default="auto")
+    parser.add_argument("--head-prefix", type=str, default="auto")
     parser.add_argument("--validate", action="store_true")
     parser.add_argument("--val-dir", type=Path, default=None)
     parser.add_argument("--val-csv", type=Path, default=None)
@@ -300,6 +346,7 @@ def main() -> None:
         output_dir=args.output_dir,
         tau_values=args.tau,
         crt_sampler_modes=args.crt_sampler_mode,
+        lws_sampler_modes=args.lws_sampler_mode,
         train_csv=args.train_csv,
         train_dir=args.train_dir,
         image_root=args.image_root,
@@ -308,6 +355,8 @@ def main() -> None:
         batch_size=args.batch_size,
         lr=args.lr,
         device=args.device,
+        head_key=args.head_key,
+        head_prefix=args.head_prefix,
     )
     payload: dict[str, object] = {
         "candidates": [candidate.__dict__ | {"checkpoint": str(candidate.checkpoint), "output": str(candidate.output)} for candidate in candidates]

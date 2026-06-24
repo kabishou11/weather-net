@@ -262,6 +262,22 @@ python3 classifier_rebalance.py \
 
 `--method crt` 会加载已有 checkpoint，冻结 backbone，只训练分类头参数；训练数据会强制沿用 checkpoint 内的 `class_to_idx`，避免重新读 CSV 时类别顺序变化导致标签错位。默认用 `sqrt` 采样在类均衡和原分布之间折中，也可用 `class_balanced` 做更强尾类纠偏。该步骤训练成本很低、推理成本不变，适合在强 backbone 收敛后修正长尾类别决策边界。建议先对单 fold 或 OOF 最差类别对应 fold 快筛，再扩展到所有 fold；若大类 precision 明显下降，则回退到原 checkpoint 或 tau-norm。
 
+LWS 分类头缩放：
+
+```bash
+python3 classifier_rebalance.py \
+  --method lws \
+  --checkpoint outputs/convnextv2_384/convnextv2_tiny.fcmae_ft_in22k_in1k_fold0.pt \
+  --train-csv data/train.csv \
+  --image-root data/images \
+  --output outputs/convnextv2_384/convnextv2_tiny.fcmae_ft_in22k_in1k_fold0_lws.pt \
+  --epochs 4 \
+  --lr 0.001 \
+  --sampler-mode sqrt
+```
+
+`--method lws` 固定 backbone 和原分类头方向，只学习每个类别的 logit scale，然后把 scale 折叠回 classifier weight/bias，生成普通 checkpoint，推理成本为零。它用于修正长尾类的分类边界，表达力高于 tau-normalization，但也更容易在小验证集上过拟合；默认 scale 限制在 `[0.25, 4.0]`，并会拒绝非 finite scale 或非法 `class_to_idx`。不要用伪标签训练 LWS/cRT，也不要只看训练 loss 下降；必须用 OOF 或本地验证集检查 macro F1、每类 F1 和头部类 precision。
+
 自动生成并汇总分类头重平衡网格：
 
 ```bash
@@ -270,6 +286,7 @@ python3 classifier_rebalance_grid.py \
   --output-dir outputs/convnextv2_384/rebalance_grid/fold0 \
   --tau 0.25 0.5 0.75 1.0 \
   --crt-sampler-mode sqrt class_balanced \
+  --lws-sampler-mode sqrt class_balanced \
   --train-csv data/train.csv \
   --image-root data/images \
   --run
@@ -298,6 +315,7 @@ python3 classifier_rebalance_grid.py \
   --output-dir outputs/convnextv2_384/rebalance_grid/fold0 \
   --tau 0.25 0.5 0.75 1.0 \
   --crt-sampler-mode sqrt class_balanced \
+  --lws-sampler-mode sqrt class_balanced \
   --train-csv data/train.csv \
   --image-root data/images \
   --run \
