@@ -189,6 +189,27 @@ python3 hard_mining.py \
 
 `hard_mining.py` 只给真实标注样本写回 `sample_weight`，不会用 OOF 结果改伪标签行；`hard_samples.csv` 可用于检查错分、低 margin 和高 loss 样本。该步骤适合在强单模 OOF 后做第二轮 fine-tune，目标是把训练容量集中到拖 macro F1 的混淆类和边界样本上，不增加推理成本。若已生成 `merged_train.csv`，也可以把它作为 `--train-csv` 输入，脚本会保留其中伪标签行的原始权重。
 
+把 OOF 混淆对 hard fine-tune 做成可复现 A/B：
+
+```bash
+python3 confusion_hard_ablation.py \
+  --base-config configs/convnextv2_384_hard_finetune.yaml \
+  --train-csv data/train.csv \
+  --oof-csv outputs/convnextv2_384/oof/oof_predictions.csv \
+  --pair-confusion-boost 0.0 0.4 0.8 \
+  --pair-min-support 2 \
+  --pair-min-error-share 0.35 \
+  --max-weight 2.2 \
+  --folds 3 \
+  --epochs 4 \
+  --min-delta-macro-f1 0.003 \
+  --min-per-class-f1 0.6 \
+  --run \
+  --summarize
+```
+
+这会为每个 `pair_confusion_boost` 生成 `train_confusion_hard_weighted.csv`、`confusion_hard_samples.csv`、训练配置和 `confusion_hard_ablation_summary.json`。默认 baseline 是 `pair0p00`，只有 macro F1 达到门槛且尾类 F1 不崩的 pair boost 才会被选中。这个步骤只改变训练采样，不改变推理图；推荐先 3-fold 快筛，再把最稳参数扩到 5-fold。
+
 ## Model Soup
 
 同架构 checkpoint 可以做权重平均，得到单 checkpoint 推理包：
