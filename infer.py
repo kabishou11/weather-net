@@ -24,6 +24,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weights", type=float, nargs="+", default=None)
     parser.add_argument("--decision-params", type=Path, default=None)
     parser.add_argument("--tta", action="store_true")
+    parser.add_argument("--amp", action="store_true")
     parser.add_argument("--device", type=str, default="auto")
     return parser.parse_args()
 
@@ -50,6 +51,7 @@ def main() -> None:
         output_image_column=args.image_column,
         output_label_column=args.label_column,
         decision_params_path=args.decision_params,
+        amp=args.amp or config.infer.amp,
     )
     print(json.dumps(stats, indent=2, ensure_ascii=False))
 

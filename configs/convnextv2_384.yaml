@@ -7,20 +7,20 @@ data:
   image_column:
   label_column:
   val_fraction: 0.2
-  folds: 1
+  folds: 5
   seed: 42
-  num_workers: 2
+  num_workers: 6
   augment_policy: weather_augmix
   transform_backend: auto
 model:
-  name: convnext_tiny
-  image_size: 224
+  name: convnextv2_tiny.fcmae_ft_in22k_in1k
+  image_size: 384
   pretrained: true
-  dropout: 0.0
+  dropout: 0.1
 train:
-  epochs: 10
-  batch_size: 32
-  lr: 0.0003
+  epochs: 18
+  batch_size: 24
+  lr: 0.0002
   weight_decay: 0.0001
   label_smoothing: 0.05
   loss_name: class_balanced_focal
@@ -28,12 +28,12 @@ train:
   class_balanced_beta: 0.999
   sampler_mode: auto
   amp: true
-  mixup_alpha: 0.2
-  cutmix_alpha: 0.3
+  mixup_alpha: 0.15
+  cutmix_alpha: 0.25
   ema_decay: 0.999
-  output_dir: outputs/convnext_tiny
+  output_dir: outputs/convnextv2_384
 infer:
-  batch_size: 64
+  batch_size: 48
   tta: false
   amp: false
-  output_csv: submission.csv
+  output_csv: submission_convnextv2_384.csv

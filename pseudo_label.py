@@ -47,6 +47,7 @@ def main() -> None:
         num_workers=config.data.num_workers,
         checkpoint_weights=args.weights,
         transform_backend=config.data.transform_backend,
+        amp=config.infer.amp,
     )
     agreement_probabilities = None
     if args.require_tta_agreement:
@@ -59,6 +60,7 @@ def main() -> None:
             num_workers=config.data.num_workers,
             checkpoint_weights=args.weights,
             transform_backend=config.data.transform_backend,
+            amp=config.infer.amp,
         )
         stats["agreement_pass"] = agreement_stats
     pseudo_rows = select_pseudo_labels(

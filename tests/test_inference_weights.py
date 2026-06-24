@@ -89,6 +89,15 @@ def test_predict_probabilities_accepts_decision_params_path_argument() -> None:
     assert "decision_params_path" in inspect.signature(predict_probabilities).parameters
 
 
+def test_predict_probabilities_amp_is_explicit_argument() -> None:
+    from src.weather_net.inference import predict_probabilities
+
+    signature = inspect.signature(predict_probabilities)
+
+    assert "amp" in signature.parameters
+    assert signature.parameters["amp"].default is False
+
+
 def _make_image(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     Image.new("RGB", (8, 8), (12, 34, 56)).save(path)

@@ -39,6 +39,10 @@ class TrainConfig:
     lr: float = 3e-4
     weight_decay: float = 1e-4
     label_smoothing: float = 0.05
+    loss_name: str = "ce"
+    focal_gamma: float = 0.0
+    class_balanced_beta: float = 0.999
+    sampler_mode: str = "auto"
     amp: bool = True
     mixup_alpha: float = 0.2
     cutmix_alpha: float = 0.0
@@ -50,6 +54,7 @@ class TrainConfig:
 class InferConfig:
     batch_size: int = 64
     tta: bool = False
+    amp: bool = False
     output_csv: Path = Path("submission.csv")
 
 
@@ -88,6 +93,7 @@ def _update_dataclass(instance: Any, values: dict[str, Any]) -> Any:
 def load_config(path: Path | None) -> AppConfig:
     config = AppConfig()
     if path is None:
+        _validate_config(config)
         return config
     raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     if not isinstance(raw, dict):
@@ -99,7 +105,25 @@ def load_config(path: Path | None) -> AppConfig:
         if not isinstance(section_values, dict):
             raise ValueError(f"Config section must be a mapping: {section_name}")
         _update_dataclass(section, section_values)
+    _validate_config(config)
     return config
+
+
+def _validate_config(config: AppConfig) -> None:
+    if config.train.loss_name not in {"ce", "focal", "class_balanced", "class_balanced_focal"}:
+        raise ValueError("train.loss_name must be one of: ce, focal, class_balanced, class_balanced_focal")
+    if config.train.focal_gamma < 0:
+        raise ValueError("train.focal_gamma must be non-negative")
+    if not 0 <= config.train.class_balanced_beta < 1:
+        raise ValueError("train.class_balanced_beta must be in [0, 1)")
+    if config.train.sampler_mode not in {"auto", "none", "weighted"}:
+        raise ValueError("train.sampler_mode must be one of: auto, none, weighted")
+    if config.train.label_smoothing < 0 or config.train.label_smoothing >= 1:
+        raise ValueError("train.label_smoothing must be in [0, 1)")
+    if config.train.mixup_alpha < 0 or config.train.cutmix_alpha < 0:
+        raise ValueError("train.mixup_alpha and train.cutmix_alpha must be non-negative")
+    if config.infer.batch_size <= 0:
+        raise ValueError("infer.batch_size must be positive")
 
 
 def resolve_device(requested: str = "auto") -> str:

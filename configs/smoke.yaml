@@ -19,6 +19,10 @@ train:
   lr: 0.001
   weight_decay: 0.0
   label_smoothing: 0.0
+  loss_name: ce
+  focal_gamma: 0.0
+  class_balanced_beta: 0.999
+  sampler_mode: auto
   amp: false
   mixup_alpha: 0.0
   cutmix_alpha: 0.0
@@ -27,4 +31,5 @@ train:
 infer:
   batch_size: 4
   tta: false
+  amp: false
   output_csv: outputs/smoke_submission.csv

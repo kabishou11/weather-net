@@ -19,6 +19,10 @@ train:
   lr: 0.0004
   weight_decay: 0.0001
   label_smoothing: 0.05
+  loss_name: class_balanced
+  focal_gamma: 0.0
+  class_balanced_beta: 0.999
+  sampler_mode: auto
   amp: true
   mixup_alpha: 0.15
   cutmix_alpha: 0.2
@@ -27,4 +31,5 @@ train:
 infer:
   batch_size: 128
   tta: false
+  amp: false
   output_csv: submission_fast.csv

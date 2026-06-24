@@ -20,6 +20,17 @@ from .postprocess import DecisionParams, load_decision_params
 from .submission import write_submission
 
 
+def _loader_kwargs(num_workers: int) -> dict[str, object]:
+    kwargs: dict[str, object] = {
+        "num_workers": num_workers,
+        "pin_memory": torch.cuda.is_available(),
+    }
+    if num_workers > 0:
+        kwargs["persistent_workers"] = True
+        kwargs["prefetch_factor"] = 2
+    return kwargs
+
+
 def load_unlabeled_rows(
     test_dir: Path | None = None,
     test_csv: Path | None = None,
@@ -137,6 +148,7 @@ def predict_probabilities(
     checkpoint_weights: Sequence[float] | None = None,
     transform_backend: str = "auto",
     decision_params_path: Path | None = None,
+    amp: bool = False,
 ) -> tuple[list[Path], list[list[float]], list[str], list[str], dict[str, object]]:
     if not checkpoints:
         raise ValueError("At least one checkpoint is required")
@@ -184,32 +196,35 @@ def predict_probabilities(
         dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=num_workers,
-        pin_memory=torch.cuda.is_available(),
+        **_loader_kwargs(num_workers),
     )
     probabilities: list[list[float]] = []
     image_paths: list[Path] = []
     image_ids: list[str] = []
     started = time.perf_counter()
 
-    for images, _, paths, ids in loader:
-        images = images.to(device)
-        logits = torch.zeros((images.size(0), len(class_names)), device=device)
-        for model, weight in zip(models, weights):
-            logits = logits + (model(images) * weight)
-        if tta:
-            augmented_logits = torch.zeros((images.size(0), len(class_names)), device=device)
-            flipped_images = torch.flip(images, dims=[3])
-            for model, weight in zip(models, weights):
-                augmented_logits = augmented_logits + (model(flipped_images) * weight)
-            logits = combine_tta_logits(logits, augmented_logits)
-        logits = logits / float(temperature)
-        if logit_bias is not None:
-            logits = logits + logit_bias
-        probs = torch.softmax(logits, dim=1).cpu().tolist()
-        probabilities.extend([[float(value) for value in row] for row in probs])
-        image_paths.extend(Path(path) for path in paths)
-        image_ids.extend(str(image_id) for image_id in ids)
+    use_amp = amp and device == "cuda"
+    with torch.inference_mode():
+        for images, _, paths, ids in loader:
+            images = images.to(device, non_blocking=True)
+            logits = torch.zeros((images.size(0), len(class_names)), device=device)
+            with torch.autocast(device_type="cuda", enabled=use_amp):
+                for model, weight in zip(models, weights):
+                    logits = logits + (model(images) * weight)
+            if tta:
+                augmented_logits = torch.zeros((images.size(0), len(class_names)), device=device)
+                flipped_images = torch.flip(images, dims=[3])
+                with torch.autocast(device_type="cuda", enabled=use_amp):
+                    for model, weight in zip(models, weights):
+                        augmented_logits = augmented_logits + (model(flipped_images) * weight)
+                logits = combine_tta_logits(logits, augmented_logits)
+            logits = logits / float(temperature)
+            if logit_bias is not None:
+                logits = logits + logit_bias
+            probs = torch.softmax(logits, dim=1).cpu().tolist()
+            probabilities.extend([[float(value) for value in row] for row in probs])
+            image_paths.extend(Path(path) for path in paths)
+            image_ids.extend(str(image_id) for image_id in ids)
 
     elapsed = time.perf_counter() - started
     stats = {
@@ -219,6 +234,7 @@ def predict_probabilities(
         "checkpoints": [str(path) for path in checkpoints],
         "checkpoint_weights": weights,
         "tta": tta,
+        "amp": use_amp,
         "decision_params": str(decision_params_path) if decision_params_path is not None else None,
     }
     return image_paths, probabilities, class_names, image_ids, stats
@@ -235,6 +251,7 @@ def predict_logits(
     checkpoint_weights: Sequence[float] | None = None,
     transform_backend: str = "auto",
     decision_params_path: Path | None = None,
+    amp: bool = False,
 ) -> tuple[list[Path], list[str], list[str], dict[str, object]]:
     image_paths, probabilities, class_names, image_ids, stats = predict_probabilities(
         checkpoints=checkpoints,
@@ -246,6 +263,7 @@ def predict_logits(
         checkpoint_weights=checkpoint_weights,
         transform_backend=transform_backend,
         decision_params_path=decision_params_path,
+        amp=amp,
     )
     predictions = [class_names[max(range(len(row)), key=lambda idx: row[idx])] for row in probabilities]
     return image_paths, predictions, image_ids, stats
@@ -268,6 +286,7 @@ def run_inference(
     output_image_column: str = "image",
     output_label_column: str = "label",
     decision_params_path: Path | None = None,
+    amp: bool = False,
 ) -> dict[str, object]:
     rows = load_unlabeled_rows(
         test_dir=test_dir,
@@ -285,6 +304,7 @@ def run_inference(
         checkpoint_weights=checkpoint_weights,
         transform_backend=transform_backend,
         decision_params_path=decision_params_path,
+        amp=amp,
     )
     write_submission(
         output_path=output_csv,

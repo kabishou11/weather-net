@@ -29,6 +29,17 @@ from .models import create_classifier
 from .oof import OofArtifactPaths, OofRecord, write_oof_artifacts
 
 
+def _loader_kwargs(num_workers: int) -> dict[str, object]:
+    kwargs: dict[str, object] = {
+        "num_workers": num_workers,
+        "pin_memory": torch.cuda.is_available(),
+    }
+    if num_workers > 0:
+        kwargs["persistent_workers"] = True
+        kwargs["prefetch_factor"] = 2
+    return kwargs
+
+
 def seed_everything(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -66,7 +77,17 @@ class ModelEma:
                 ema_value.copy_(model_value)
 
 
-def make_sampler(rows: Sequence[ManifestRow]) -> WeightedRandomSampler | None:
+def make_sampler(
+    rows: Sequence[ManifestRow],
+    sampler_mode: str = "auto",
+    loss_name: str = "ce",
+) -> WeightedRandomSampler | None:
+    if sampler_mode not in {"auto", "none", "weighted"}:
+        raise ValueError("sampler_mode must be one of: auto, none, weighted")
+    if sampler_mode == "none":
+        return None
+    if sampler_mode == "auto" and "class_balanced" in loss_name:
+        return None
     labels = _labels(rows)
     counts = np.bincount(labels)
     if len(counts) == 0 or counts.min() == counts.max():
@@ -83,6 +104,8 @@ def make_loaders(
     num_workers: int,
     augment_policy: str = "standard",
     transform_backend: str = "auto",
+    sampler_mode: str = "auto",
+    loss_name: str = "ce",
 ) -> tuple[DataLoader, DataLoader]:
     train_dataset = WeatherImageDataset(
         train_rows,
@@ -102,21 +125,19 @@ def make_loaders(
             backend=transform_backend,
         ),
     )
-    sampler = make_sampler(train_rows)
+    sampler = make_sampler(train_rows, sampler_mode=sampler_mode, loss_name=loss_name)
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=sampler is None,
         sampler=sampler,
-        num_workers=num_workers,
-        pin_memory=torch.cuda.is_available(),
+        **_loader_kwargs(num_workers),
     )
     val_loader = DataLoader(
         val_dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=num_workers,
-        pin_memory=torch.cuda.is_available(),
+        **_loader_kwargs(num_workers),
     )
     return train_loader, val_loader
 
@@ -143,15 +164,15 @@ def _mixup_batch(
     targets: torch.Tensor,
     num_classes: int,
     alpha: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, float]:
     if alpha <= 0:
-        return images, _one_hot_targets(targets, num_classes)
+        return images, _one_hot_targets(targets, num_classes), None, 1.0
     lam = np.random.beta(alpha, alpha)
     permutation = torch.randperm(images.size(0), device=images.device)
     mixed_images = lam * images + (1 - lam) * images[permutation]
     hard_targets = _one_hot_targets(targets, num_classes)
     mixed_targets = lam * hard_targets + (1 - lam) * hard_targets[permutation]
-    return mixed_images, mixed_targets
+    return mixed_images, mixed_targets, permutation, float(lam)
 
 
 def _rand_bbox(width: int, height: int, lam: float) -> tuple[int, int, int, int]:
@@ -176,9 +197,9 @@ def _cutmix_batch(
     targets: torch.Tensor,
     num_classes: int,
     alpha: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, float]:
     if alpha <= 0:
-        return images, _one_hot_targets(targets, num_classes)
+        return images, _one_hot_targets(targets, num_classes), None, 1.0
     lam = np.random.beta(alpha, alpha)
     permutation = torch.randperm(images.size(0), device=images.device)
     if images.size(0) > 1 and torch.equal(permutation, torch.arange(images.size(0), device=images.device)):
@@ -190,7 +211,7 @@ def _cutmix_batch(
     lam = 1.0 - ((x2 - x1) * (y2 - y1) / float(width * height))
     hard_targets = _one_hot_targets(targets, num_classes)
     mixed_targets = lam * hard_targets + (1 - lam) * hard_targets[permutation]
-    return mixed_images, mixed_targets
+    return mixed_images, mixed_targets, permutation, float(lam)
 
 
 def apply_batch_augmentations(
@@ -199,23 +220,50 @@ def apply_batch_augmentations(
     num_classes: int,
     mixup_alpha: float,
     cutmix_alpha: float,
+    sample_weights: torch.Tensor | None = None,
     force_mode: str | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return_weights = sample_weights is not None
+
+    def _with_optional_weights(
+        mixed_images: torch.Tensor,
+        soft_targets: torch.Tensor,
+        permutation: torch.Tensor | None = None,
+        lam: float = 1.0,
+    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if not return_weights:
+            return mixed_images, soft_targets
+        assert sample_weights is not None
+        if permutation is None:
+            return mixed_images, soft_targets, soft_targets * sample_weights.unsqueeze(1)
+        hard_targets = _one_hot_targets(targets, num_classes)
+        weighted_targets = (
+            (float(lam) * hard_targets * sample_weights.unsqueeze(1))
+            + ((1.0 - float(lam)) * hard_targets[permutation] * sample_weights[permutation].unsqueeze(1))
+        )
+        return mixed_images, soft_targets, weighted_targets
+
     if force_mode not in {None, "none", "mixup", "cutmix"}:
         raise ValueError("force_mode must be one of: none, mixup, cutmix")
     if force_mode == "none" or (mixup_alpha <= 0 and cutmix_alpha <= 0):
-        return images, _one_hot_targets(targets, num_classes)
+        return _with_optional_weights(images, _one_hot_targets(targets, num_classes))
     if force_mode == "mixup":
-        return _mixup_batch(images, targets, num_classes, mixup_alpha)
+        mixed_images, soft_targets, permutation, lam = _mixup_batch(images, targets, num_classes, mixup_alpha)
+        return _with_optional_weights(mixed_images, soft_targets, permutation, lam)
     if force_mode == "cutmix":
-        return _cutmix_batch(images, targets, num_classes, cutmix_alpha)
+        mixed_images, soft_targets, permutation, lam = _cutmix_batch(images, targets, num_classes, cutmix_alpha)
+        return _with_optional_weights(mixed_images, soft_targets, permutation, lam)
     if mixup_alpha > 0 and cutmix_alpha > 0:
         if random.random() < 0.5:
-            return _mixup_batch(images, targets, num_classes, mixup_alpha)
-        return _cutmix_batch(images, targets, num_classes, cutmix_alpha)
+            mixed_images, soft_targets, permutation, lam = _mixup_batch(images, targets, num_classes, mixup_alpha)
+            return _with_optional_weights(mixed_images, soft_targets, permutation, lam)
+        mixed_images, soft_targets, permutation, lam = _cutmix_batch(images, targets, num_classes, cutmix_alpha)
+        return _with_optional_weights(mixed_images, soft_targets, permutation, lam)
     if mixup_alpha > 0:
-        return _mixup_batch(images, targets, num_classes, mixup_alpha)
-    return _cutmix_batch(images, targets, num_classes, cutmix_alpha)
+        mixed_images, soft_targets, permutation, lam = _mixup_batch(images, targets, num_classes, mixup_alpha)
+        return _with_optional_weights(mixed_images, soft_targets, permutation, lam)
+    mixed_images, soft_targets, permutation, lam = _cutmix_batch(images, targets, num_classes, cutmix_alpha)
+    return _with_optional_weights(mixed_images, soft_targets, permutation, lam)
 
 
 def _soft_cross_entropy(
@@ -223,12 +271,80 @@ def _soft_cross_entropy(
     soft_targets: torch.Tensor,
     sample_weights: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    return weighted_soft_cross_entropy(logits, soft_targets, sample_weights=sample_weights)
+
+
+def _apply_label_smoothing(
+    soft_targets: torch.Tensor,
+    label_smoothing: float,
+) -> torch.Tensor:
+    if label_smoothing <= 0:
+        return soft_targets
+    num_classes = soft_targets.shape[1]
+    return soft_targets * (1.0 - label_smoothing) + (label_smoothing / num_classes)
+
+
+def _apply_weighted_label_smoothing(
+    weighted_targets: torch.Tensor,
+    label_smoothing: float,
+) -> torch.Tensor:
+    if label_smoothing <= 0:
+        return weighted_targets
+    num_classes = weighted_targets.shape[1]
+    row_weight = weighted_targets.sum(dim=1, keepdim=True)
+    return weighted_targets * (1.0 - label_smoothing) + (row_weight * label_smoothing / num_classes)
+
+
+def compute_class_weights(
+    labels: Sequence[int],
+    num_classes: int,
+    loss_name: str,
+    beta: float = 0.999,
+) -> torch.Tensor | None:
+    if loss_name not in {"ce", "focal", "class_balanced", "class_balanced_focal"}:
+        raise ValueError("loss_name must be one of: ce, focal, class_balanced, class_balanced_focal")
+    if "class_balanced" not in loss_name:
+        return None
+    if not 0 <= beta < 1:
+        raise ValueError("class_balanced_beta must be in [0, 1)")
+    counts = torch.bincount(torch.tensor(labels, dtype=torch.long), minlength=num_classes).float()
+    counts = counts.clamp_min(1.0)
+    effective_num = 1.0 - torch.pow(torch.tensor(beta, dtype=torch.float32), counts)
+    weights = (1.0 - beta) / effective_num.clamp_min(1e-12)
+    return weights / weights.mean().clamp_min(1e-12)
+
+
+def weighted_soft_cross_entropy(
+    logits: torch.Tensor,
+    soft_targets: torch.Tensor,
+    sample_weights: torch.Tensor | None = None,
+    class_weights: torch.Tensor | None = None,
+    focal_gamma: float = 0.0,
+    reduction: str = "mean",
+) -> torch.Tensor:
+    if reduction not in {"mean", "none"}:
+        raise ValueError("reduction must be one of: mean, none")
+    if focal_gamma < 0:
+        raise ValueError("focal_gamma must be non-negative")
     log_probs = torch.nn.functional.log_softmax(logits, dim=1)
-    losses = -(soft_targets * log_probs).sum(dim=1)
+    weights = soft_targets
+    target_weight = soft_targets.sum(dim=1).to(logits.device, dtype=logits.dtype).clamp_min(1e-12)
+    if class_weights is not None:
+        class_weights = class_weights.to(logits.device, dtype=logits.dtype)
+        weights = weights * class_weights
+        target_weight = weights.sum(dim=1).clamp_min(1e-12)
+    if focal_gamma > 0:
+        probs = log_probs.exp()
+        weights = weights * torch.pow(1.0 - probs, focal_gamma)
+    losses = -(weights * log_probs).sum(dim=1)
+    if reduction == "none":
+        return losses
+    normalizer = target_weight
     if sample_weights is not None:
         sample_weights = sample_weights.to(losses.device).float()
-        return (losses * sample_weights).sum() / sample_weights.sum().clamp_min(1e-8)
-    return losses.mean()
+        normalizer = normalizer * sample_weights
+        return (losses * sample_weights).sum() / normalizer.sum().clamp_min(1e-8)
+    return losses.sum() / normalizer.sum().clamp_min(1e-8)
 
 
 def train_one_epoch(
@@ -242,37 +358,54 @@ def train_one_epoch(
     mixup_alpha: float,
     cutmix_alpha: float,
     amp: bool,
+    loss_name: str = "ce",
+    focal_gamma: float = 0.0,
+    class_weights: torch.Tensor | None = None,
     model_ema: ModelEma | None = None,
 ) -> float:
     model.train()
     total_loss = 0.0
     total_items = 0
-    criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing, reduction="none")
     use_amp = amp and device == "cuda"
+    class_weights = None if class_weights is None else class_weights.to(device)
+    use_focal = loss_name in {"focal", "class_balanced_focal"}
 
     for images, targets, sample_weights in loader:
-        images = images.to(device)
-        targets = targets.to(device)
-        sample_weights = sample_weights.to(device)
+        images = images.to(device, non_blocking=True)
+        targets = targets.to(device, non_blocking=True)
+        sample_weights = sample_weights.to(device, non_blocking=True)
         optimizer.zero_grad(set_to_none=True)
         with torch.autocast(device_type="cuda", enabled=use_amp):
             if mixup_alpha > 0 or cutmix_alpha > 0:
-                images, soft_targets = apply_batch_augmentations(
+                images, soft_targets, weighted_targets = apply_batch_augmentations(
                     images,
                     targets,
                     num_classes=num_classes,
                     mixup_alpha=mixup_alpha,
                     cutmix_alpha=cutmix_alpha,
+                    sample_weights=sample_weights,
                 )
+                soft_targets = _apply_label_smoothing(soft_targets, label_smoothing)
+                weighted_targets = _apply_weighted_label_smoothing(weighted_targets, label_smoothing)
                 logits = model(images)
-                loss = _soft_cross_entropy(logits, soft_targets, sample_weights)
+                loss = weighted_soft_cross_entropy(
+                    logits,
+                    weighted_targets,
+                    sample_weights=None,
+                    class_weights=class_weights,
+                    focal_gamma=focal_gamma if use_focal else 0.0,
+                )
             else:
                 logits = model(images)
-                losses = criterion(logits, targets)
-                if losses.ndim == 0:
-                    loss = losses
-                else:
-                    loss = (losses * sample_weights).sum() / sample_weights.sum().clamp_min(1e-8)
+                soft_targets = _one_hot_targets(targets, num_classes=num_classes)
+                soft_targets = _apply_label_smoothing(soft_targets, label_smoothing)
+                loss = weighted_soft_cross_entropy(
+                    logits,
+                    soft_targets,
+                    sample_weights=sample_weights,
+                    class_weights=class_weights,
+                    focal_gamma=focal_gamma if use_focal else 0.0,
+                )
         scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
@@ -297,9 +430,9 @@ def evaluate(
     total_items = 0
     criterion = nn.CrossEntropyLoss(reduction="none")
     for images, targets, sample_weights in loader:
-        images = images.to(device)
-        targets = targets.to(device)
-        sample_weights = sample_weights.to(device)
+        images = images.to(device, non_blocking=True)
+        targets = targets.to(device, non_blocking=True)
+        sample_weights = sample_weights.to(device, non_blocking=True)
         logits = model(images)
         losses = criterion(logits, targets)
         loss = (losses * sample_weights).sum() / sample_weights.sum().clamp_min(1e-8)
@@ -345,14 +478,13 @@ def collect_oof_predictions(
             dataset,
             batch_size=batch_size,
             shuffle=False,
-            num_workers=num_workers,
-            pin_memory=torch.cuda.is_available(),
+            **_loader_kwargs(num_workers),
         )
 
     records: list[OofRecord] = []
     offset = 0
     for images, targets, _sample_weights in loader:
-        images = images.to(device)
+        images = images.to(device, non_blocking=True)
         logits = model(images).detach().cpu().float()
         targets = targets.detach().cpu().tolist()
         batch_rows = rows[offset : offset + len(targets)]
@@ -473,6 +605,8 @@ def train_config(config: AppConfig, device_request: str = "auto") -> list[Path]:
             num_workers=config.data.num_workers,
             augment_policy=config.data.augment_policy,
             transform_backend=config.data.transform_backend,
+            sampler_mode=config.train.sampler_mode,
+            loss_name=config.train.loss_name,
         )
         model = create_classifier(
             config.model.name,
@@ -481,6 +615,12 @@ def train_config(config: AppConfig, device_request: str = "auto") -> list[Path]:
             drop_rate=config.model.dropout,
         ).to(device)
         model_ema = ModelEma(model, config.train.ema_decay) if config.train.ema_decay > 0 else None
+        class_weights = compute_class_weights(
+            labels=_labels(train_rows),
+            num_classes=len(class_names),
+            loss_name=config.train.loss_name,
+            beta=config.train.class_balanced_beta,
+        )
         optimizer = torch.optim.AdamW(
             model.parameters(),
             lr=config.train.lr,
@@ -510,6 +650,9 @@ def train_config(config: AppConfig, device_request: str = "auto") -> list[Path]:
                 mixup_alpha=config.train.mixup_alpha,
                 cutmix_alpha=config.train.cutmix_alpha,
                 amp=config.train.amp,
+                loss_name=config.train.loss_name,
+                focal_gamma=config.train.focal_gamma,
+                class_weights=class_weights,
                 model_ema=model_ema,
             )
             eval_model = model_ema.module if model_ema is not None else model
