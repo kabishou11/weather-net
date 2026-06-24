@@ -515,3 +515,71 @@ def test_external_merge_audit_rejects_csv_content_changed_after_merge(tmp_path) 
 
     with pytest.raises(ValueError, match="row_digest"):
         validate_external_merge_audit(manifest, config)
+
+
+def test_load_training_manifest_uses_official_class_map_for_csv(tmp_path) -> None:
+    import json
+
+    from src.weather_net.config import AppConfig
+    from src.weather_net.training import load_training_manifest
+
+    image_root = tmp_path / "images"
+    image_root.mkdir()
+    (image_root / "sunny.jpg").write_bytes(b"not-read-by-loader")
+    train_csv = tmp_path / "train.csv"
+    train_csv.write_text("image,label\nsunny.jpg,sunny\n", encoding="utf-8")
+    class_map = tmp_path / "class_to_idx.json"
+    class_map.write_text(json.dumps({"rain": 0, "sunny": 1}) + "\n", encoding="utf-8")
+
+    config = AppConfig()
+    config.data.train_csv = train_csv
+    config.data.image_root = image_root
+    config.data.class_map = class_map
+
+    rows, class_to_idx = load_training_manifest(config)
+
+    assert class_to_idx == {"rain": 0, "sunny": 1}
+    assert rows[0].label == 1
+
+
+def test_load_training_manifest_rejects_csv_label_outside_official_class_map(tmp_path) -> None:
+    import json
+    import pytest
+
+    from src.weather_net.config import AppConfig
+    from src.weather_net.training import load_training_manifest
+
+    train_csv = tmp_path / "train.csv"
+    train_csv.write_text("image,label\nrainbow.jpg,rainbow\n", encoding="utf-8")
+    class_map = tmp_path / "class_to_idx.json"
+    class_map.write_text(json.dumps({"rain": 0, "sunny": 1}) + "\n", encoding="utf-8")
+
+    config = AppConfig()
+    config.data.train_csv = train_csv
+    config.data.image_root = tmp_path
+    config.data.class_map = class_map
+
+    with pytest.raises(ValueError, match="class mapping"):
+        load_training_manifest(config)
+
+
+def test_load_training_manifest_uses_official_class_map_for_imagefolder(tmp_path) -> None:
+    import json
+
+    from src.weather_net.config import AppConfig
+    from src.weather_net.training import load_training_manifest
+
+    train_dir = tmp_path / "train"
+    (train_dir / "sunny").mkdir(parents=True)
+    (train_dir / "sunny" / "sunny.jpg").write_bytes(b"not-read-by-loader")
+    class_map = tmp_path / "class_to_idx.json"
+    class_map.write_text(json.dumps({"rain": 0, "sunny": 1}) + "\n", encoding="utf-8")
+
+    config = AppConfig()
+    config.data.train_dir = train_dir
+    config.data.class_map = class_map
+
+    rows, class_to_idx = load_training_manifest(config)
+
+    assert class_to_idx == {"rain": 0, "sunny": 1}
+    assert rows[0].label == 1

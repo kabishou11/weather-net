@@ -24,6 +24,7 @@ from .data import (
     idx_to_class,
     is_validation_source,
     iter_kfold_splits,
+    load_class_mapping,
     save_class_mapping,
     split_train_val,
 )
@@ -171,12 +172,14 @@ def make_loaders(
 
 
 def load_training_manifest(config: AppConfig) -> tuple[list[ManifestRow], dict[str, int]]:
+    class_to_idx = load_class_mapping(config.data.class_map) if config.data.class_map is not None else None
     if config.data.train_dir is not None:
-        return build_manifest_from_image_folder(config.data.train_dir)
+        return build_manifest_from_image_folder(config.data.train_dir, class_to_idx=class_to_idx)
     if config.data.train_csv is not None:
         return build_manifest_from_csv(
             config.data.train_csv,
             image_root=config.data.image_root,
+            class_to_idx=class_to_idx,
             image_column=config.data.image_column,
             label_column=config.data.label_column,
         )

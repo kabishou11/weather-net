@@ -591,10 +591,11 @@ python3 merge_external_training.py \
 data:
   train_csv: data/train_with_external_common5.csv
   image_root: .
+  class_map: outputs/convnextv2_384/class_to_idx.json
   external_audit_json: outputs/preflight_train_with_external_common5_audit.json
 ```
 
-训练入口会 fail-closed：只要 CSV 中包含 `source=external` 或 `external_*`，但没有匹配 `merge_external_training.py` 产出的 audit，就会拒绝开训，避免把外部-only 或未经官方去重的 CSV 跑成一次长训练。
+训练入口会 fail-closed：只要 CSV 中包含 `source=external` 或 `external_*`，但没有匹配 `merge_external_training.py` 产出的 audit，就会拒绝开训，避免把外部-only 或未经官方去重的 CSV 跑成一次长训练。训练配置建议始终设置 `data.class_map` 指向官方训练首次生成的 `class_to_idx.json`，后续 OOF teacher、外部合并、hard mining、蒸馏和提交推理都沿用同一份映射，避免 CSV 标签推断导致分类头顺序漂移。
 
 ## 一次性服务器训练路线
 
@@ -627,6 +628,7 @@ python3 training_preflight.py \
   --config configs/convnextv2_384.yaml \
   --train-csv data/train_with_external.csv \
   --image-root data/images \
+  --class-map outputs/convnextv2_384/class_to_idx.json \
   --check-image-exists \
   --check-readable-images \
   --check-unique-image-hash \
