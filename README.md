@@ -396,6 +396,21 @@ python3 merge_pseudo_labels.py \
   --output merged_train.csv
 ```
 
+如果 `pseudo_labels_filtered.csv` 已包含 `teacher_{class}` soft label，可显式启用 Noisy Student 式伪标签蒸馏合并：
+
+```bash
+python3 merge_pseudo_labels.py \
+  --train-csv data/train_teacher.csv \
+  --image-root data/images \
+  --pseudo-csv pseudo_labels_filtered.csv \
+  --pseudo-image-root data/unlabeled \
+  --min-confidence 0.95 \
+  --allow-pseudo-teacher \
+  --output data/merged_teacher_pseudo.csv
+```
+
+启用后会要求伪标签 teacher 概率覆盖全部类别、非负有限、和为 1，且 teacher top-1 必须和伪标签类别一致；真实标注行若已有 OOF soft teacher 会原样保留，否则补 one-hot teacher，保证蒸馏训练每行都有完整 soft target。
+
 用合并后的 CSV 再训练：
 
 ```bash
@@ -478,19 +493,27 @@ unzip -q -o data/external/weapd_kaggle/weather-dataset.zip -d data/external/weap
 python3 external_dataset_manifest.py \
   --image-root "data/external/mwd_kaggle/Multi-class Weather Dataset" \
   --dataset-name external_mwd \
+  --dataset-url https://data.mendeley.com/datasets/4drtyfjtfy/1 \
+  --license "CC BY 4.0" \
+  --doi 10.17632/4drtyfjtfy.1 \
   --label-map-preset mwd \
+  --class-map outputs/convnextv2_384/class_to_idx.json \
   --output-csv data/external/mwd_kaggle/external_train.csv \
   --summary-json data/external/mwd_kaggle/summary.json
 
 python3 external_dataset_manifest.py \
   --image-root data/external/weapd_kaggle/dataset \
   --dataset-name external_weapd \
+  --dataset-url "https://dataverse.harvard.edu/dataset.xhtml?persistentId=doi:10.7910/DVN/M8JQCR" \
+  --license CC0 \
+  --doi 10.7910/DVN/M8JQCR \
   --label-map-preset weapd \
+  --class-map outputs/convnextv2_384/class_to_idx.json \
   --output-csv data/external/weapd_kaggle/external_train.csv \
   --summary-json data/external/weapd_kaggle/summary.json
 ```
 
-如果官方类别不包含 `dew/lightning/rainbow/sandstorm` 这类标签，用自定义 JSON 映射并开启 `--drop-unmapped`，只保留能对齐官方类别的样本。
+如果官方类别不包含 `dew/lightning/rainbow/sandstorm` 这类标签，`--class-map` 会直接阻止它们进入 manifest；可用自定义 JSON 映射并开启 `--drop-unmapped`，只保留能对齐官方类别的样本。summary 会记录 `dataset_url/license/doi/label_map_sha256`，便于赛前审计数据来源。
 
 外部数据默认不直接等权并入官方训练集。推荐用法是：先按官方类别过滤，再加 `source=external` 和低 `sample_weight`，或只导出 DINOv2/CLIP/timm embedding 给 `embedding_guard.py` 做伪标签语义裁判。若比赛规则禁止外部数据，则这些数据只能用于本地鲁棒性分析，不进入最终训练。
 
@@ -544,7 +567,7 @@ python3 training_preflight.py \
   --max-checkpoints 1
 ```
 
-当 `train.distillation_alpha > 0` 时，preflight 会要求每一行都有完整 `teacher_{class_name}` 概率列，并要求 teacher 训练 CSV 只包含真实标注行。`--train-csv` 和 `--train-dir` 不能同时设置；当外部数据未显式允许、伪标签低于门槛、某类样本低于门槛、推理 stats 超预算或 TTA 未被允许时，会直接失败。
+当 `train.distillation_alpha > 0` 时，preflight 会要求每一行都有完整 `teacher_{class_name}` 概率列，并默认要求 teacher 训练 CSV 只包含真实标注行。若要训练 Noisy Student 伪标签 teacher CSV，必须显式加 `--allow-pseudo-teacher-distillation`，并同时设置 `--pseudo-min-confidence` 与 `--pseudo-max-ratio`。`--train-csv` 和 `--train-dir` 不能同时设置；当外部数据未显式允许、伪标签低于门槛、某类样本低于门槛、推理 stats 超预算或 TTA 未被允许时，会直接失败。
 
 ## 四天冲分顺序
 

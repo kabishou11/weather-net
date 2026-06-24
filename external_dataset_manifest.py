@@ -7,7 +7,7 @@ import json
 from collections import Counter
 from pathlib import Path
 
-from src.weather_net.data import is_image_file
+from src.weather_net.data import idx_to_class, is_image_file, load_class_mapping
 
 
 DEFAULT_LABEL_MAPS: dict[str, dict[str, str]] = {
@@ -53,6 +53,24 @@ def _load_label_map(path: Path | None, preset: str | None) -> dict[str, str]:
     return mapping
 
 
+def load_allowed_labels(allowed_labels: list[str] | None, class_map: Path | None) -> list[str] | None:
+    if class_map is not None:
+        class_labels = idx_to_class(load_class_mapping(class_map))
+        if allowed_labels is None:
+            return class_labels
+        requested = sorted(dict.fromkeys(str(label).strip() for label in allowed_labels if str(label).strip()))
+        outside = sorted(set(requested) - set(class_labels))
+        if outside:
+            raise ValueError(f"allowed labels outside class map: {outside}")
+        return [label for label in class_labels if label in set(requested)]
+    labels: list[str] = []
+    if allowed_labels is not None:
+        labels.extend(str(label).strip() for label in allowed_labels if str(label).strip())
+    if not labels:
+        return None
+    return sorted(dict.fromkeys(labels))
+
+
 def _label_from_relative_path(path: Path, label_map: dict[str, str]) -> tuple[str, str, bool]:
     parts = [_normalize_label(part) for part in path.parts[:-1]]
     if not parts:
@@ -75,10 +93,14 @@ def build_external_manifest(
     dataset_url: str = "",
     license_name: str = "",
     doi: str = "",
+    allowed_labels: list[str] | None = None,
 ) -> dict[str, object]:
     image_root = image_root.expanduser().resolve()
+    if not dataset_name.strip().startswith("external_"):
+        raise ValueError("dataset_name must start with external_")
     rows: list[tuple[str, str, str, str, str, str, str]] = []
     skipped: Counter[str] = Counter()
+    allowed_label_set = set(allowed_labels) if allowed_labels is not None else None
     normalized_label_map = {str(key): str(value) for key, value in sorted(label_map.items())}
     label_map_sha256 = hashlib.sha256(
         json.dumps(normalized_label_map, sort_keys=True, ensure_ascii=False).encode("utf-8")
@@ -94,6 +116,8 @@ def build_external_manifest(
         if drop_unmapped and not is_mapped:
             skipped[original_label] += 1
             continue
+        if allowed_label_set is not None and mapped_label not in allowed_label_set:
+            raise ValueError(f"mapped labels outside allowed labels: {[mapped_label]}")
         image = relative_path.as_posix()
         rows.append((image, mapped_label, dataset_name, original_label, dataset_url, license_name, doi))
 
@@ -122,6 +146,7 @@ def build_external_manifest(
         "original_label_counts": dict(sorted(original_counts.items())),
         "skipped_unmapped": dict(sorted(skipped.items())),
         "label_map_sha256": label_map_sha256,
+        "allowed_labels": list(allowed_labels) if allowed_labels is not None else None,
     }
     summary_json.parent.mkdir(parents=True, exist_ok=True)
     summary_json.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -139,6 +164,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--doi", default="")
     parser.add_argument("--label-map-preset", choices=sorted(DEFAULT_LABEL_MAPS), default=None)
     parser.add_argument("--label-map-json", type=Path, default=None)
+    parser.add_argument("--allowed-labels", nargs="+", default=None)
+    parser.add_argument("--class-map", type=Path, default=None)
+    parser.add_argument("--allow-unbounded-labels", action="store_true")
     parser.add_argument("--drop-unmapped", action="store_true")
     return parser.parse_args()
 
@@ -146,6 +174,9 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     label_map = _load_label_map(args.label_map_json, args.label_map_preset)
+    allowed_labels = load_allowed_labels(args.allowed_labels, args.class_map)
+    if allowed_labels is None and not args.allow_unbounded_labels:
+        raise ValueError("external manifest generation requires --class-map or --allowed-labels")
     summary = build_external_manifest(
         image_root=args.image_root,
         output_csv=args.output_csv,
@@ -156,6 +187,7 @@ def main() -> None:
         dataset_url=args.dataset_url,
         license_name=args.license_name,
         doi=args.doi,
+        allowed_labels=allowed_labels,
     )
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 

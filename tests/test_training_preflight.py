@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import pytest
 from PIL import Image
 
 
@@ -284,9 +285,93 @@ def test_preflight_rejects_teacher_distillation_with_pseudo_or_external_rows(tmp
         encoding="utf-8",
     )
 
-    with pytest.raises(ValueError, match="teacher distillation preflight expects labeled rows only"):
+    with pytest.raises(ValueError, match="teacher distillation preflight found disallowed sources"):
         run_preflight_checks(
             config_path=config_path,
             train_csv=train_csv,
             image_root=tmp_path / "images",
+        )
+
+
+def test_preflight_allows_pseudo_teacher_distillation_with_explicit_gates(tmp_path: Path) -> None:
+    from training_preflight import run_preflight_checks
+
+    _make_image(tmp_path / "images" / "labeled.jpg")
+    _make_image(tmp_path / "images" / "pseudo.jpg")
+    train_csv = tmp_path / "train.csv"
+    train_csv.write_text(
+        "image,label,source,confidence,teacher_rain\n"
+        "labeled.jpg,rain,labeled,1.0,1.0\n"
+        "pseudo.jpg,rain,pseudo,0.97,1.0\n",
+        encoding="utf-8",
+    )
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "train:\n"
+        "  distillation_alpha: 0.3\n",
+        encoding="utf-8",
+    )
+
+    result = run_preflight_checks(
+        config_path=config_path,
+        train_csv=train_csv,
+        image_root=tmp_path / "images",
+        allow_pseudo_teacher_distillation=True,
+        pseudo_min_confidence=0.95,
+        pseudo_max_ratio=1.0,
+    )
+
+    assert result["teacher_distillation"]["enabled"] is True
+    assert result["source_counts"] == {"labeled": 1, "pseudo": 1}
+
+
+@pytest.mark.parametrize("confidence", ["nan", "inf", "1.2", "-0.1"])
+def test_preflight_rejects_invalid_pseudo_confidence(tmp_path: Path, confidence: str) -> None:
+    from training_preflight import run_preflight_checks
+
+    _make_image(tmp_path / "images" / "labeled.jpg")
+    _make_image(tmp_path / "images" / "pseudo.jpg")
+    train_csv = tmp_path / "train.csv"
+    train_csv.write_text(
+        "image,label,source,confidence\n"
+        "labeled.jpg,rain,labeled,1.0\n"
+        f"pseudo.jpg,rain,pseudo,{confidence}\n",
+        encoding="utf-8",
+    )
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("train:\n  distillation_alpha: 0.0\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match=r"confidence must be finite and in \[0, 1\]"):
+        run_preflight_checks(
+            config_path=config_path,
+            train_csv=train_csv,
+            image_root=tmp_path / "images",
+        )
+
+
+def test_preflight_rejects_pseudo_teacher_top1_disagreement(tmp_path: Path) -> None:
+    from training_preflight import run_preflight_checks
+
+    _make_image(tmp_path / "images" / "labeled.jpg")
+    _make_image(tmp_path / "images" / "pseudo.jpg")
+    _make_image(tmp_path / "images" / "sunny.jpg")
+    train_csv = tmp_path / "train.csv"
+    train_csv.write_text(
+        "image,label,source,confidence,teacher_rain,teacher_sunny\n"
+        "labeled.jpg,rain,labeled,1.0,0.9,0.1\n"
+        "sunny.jpg,sunny,labeled,1.0,0.1,0.9\n"
+        "pseudo.jpg,rain,pseudo,0.97,0.1,0.9\n",
+        encoding="utf-8",
+    )
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("train:\n  distillation_alpha: 0.3\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="pseudo teacher top1 differs from pseudo label"):
+        run_preflight_checks(
+            config_path=config_path,
+            train_csv=train_csv,
+            image_root=tmp_path / "images",
+            allow_pseudo_teacher_distillation=True,
+            pseudo_min_confidence=0.95,
+            pseudo_max_ratio=1.0,
         )

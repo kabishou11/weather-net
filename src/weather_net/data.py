@@ -143,6 +143,8 @@ def build_manifest_from_csv(
         label_name = str(row[label_column]).strip()
         source = str(row.get(source_column, "labeled")).strip() if source_column else "labeled"
         confidence = float(row.get(confidence_column, 1.0)) if confidence_column else 1.0
+        if not math.isfinite(confidence) or confidence < 0 or confidence > 1:
+            raise ValueError(f"confidence must be finite and in [0, 1]: {image_id}")
         if sample_weight_column:
             sample_weight = float(row[sample_weight_column])
         elif source == "pseudo":

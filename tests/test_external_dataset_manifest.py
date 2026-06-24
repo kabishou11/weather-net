@@ -20,7 +20,7 @@ def test_external_manifest_maps_mwd_labels(tmp_path: Path) -> None:
         image_root=root,
         output_csv=tmp_path / "mwd.csv",
         summary_json=tmp_path / "mwd.json",
-        dataset_name="mwd",
+        dataset_name="external_mwd",
         label_map=DEFAULT_LABEL_MAPS["mwd"],
         dataset_url="https://data.mendeley.com/datasets/4drtyfjtfy/1",
         license_name="CC BY 4.0",
@@ -50,7 +50,7 @@ def test_external_manifest_maps_weapd_weather_variants(tmp_path: Path) -> None:
         image_root=root,
         output_csv=tmp_path / "weapd.csv",
         summary_json=tmp_path / "weapd.json",
-        dataset_name="weapd",
+        dataset_name="external_weapd",
         label_map=DEFAULT_LABEL_MAPS["weapd"],
     )
 
@@ -67,7 +67,7 @@ def test_external_manifest_rejects_empty_image_root(tmp_path: Path) -> None:
             image_root=tmp_path,
             output_csv=tmp_path / "empty.csv",
             summary_json=tmp_path / "empty.json",
-            dataset_name="empty",
+            dataset_name="external_empty",
             label_map={},
         )
 
@@ -83,13 +83,167 @@ def test_external_manifest_drops_unmapped_labels_when_requested(tmp_path: Path) 
         image_root=root,
         output_csv=tmp_path / "filtered.csv",
         summary_json=tmp_path / "filtered.json",
-        dataset_name="external",
+        dataset_name="external_test",
         label_map={"rain": "rain"},
         drop_unmapped=True,
+        allowed_labels=["rain"],
     )
 
     assert summary["label_counts"] == {"rain": 1}
     assert summary["skipped_unmapped"] == {"rainbow": 1}
+
+
+def test_external_manifest_main_requires_label_boundary(monkeypatch, tmp_path: Path) -> None:
+    import pytest
+    import sys
+
+    from external_dataset_manifest import main
+
+    root = tmp_path / "external"
+    _make_image(root / "rain" / "rain1.jpg")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "external_dataset_manifest.py",
+            "--image-root",
+            str(root),
+            "--output-csv",
+            str(tmp_path / "external.csv"),
+            "--summary-json",
+            str(tmp_path / "summary.json"),
+            "--dataset-name",
+            "external_test",
+            "--label-map-preset",
+            "mwd",
+        ],
+    )
+
+    with pytest.raises(ValueError, match="requires --class-map or --allowed-labels"):
+        main()
+
+
+def test_external_manifest_main_allows_explicit_unbounded_label_exploration(monkeypatch, tmp_path: Path) -> None:
+    import sys
+
+    from external_dataset_manifest import main
+
+    root = tmp_path / "external"
+    _make_image(root / "rain" / "rain1.jpg")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "external_dataset_manifest.py",
+            "--image-root",
+            str(root),
+            "--output-csv",
+            str(tmp_path / "external.csv"),
+            "--summary-json",
+            str(tmp_path / "summary.json"),
+            "--dataset-name",
+            "external_test",
+            "--label-map-preset",
+            "mwd",
+            "--allow-unbounded-labels",
+        ],
+    )
+
+    main()
+
+    assert (tmp_path / "external.csv").exists()
+
+
+def test_external_manifest_rejects_labels_outside_allowed_set(tmp_path: Path) -> None:
+    import pytest
+
+    from external_dataset_manifest import build_external_manifest
+
+    root = tmp_path / "external"
+    _make_image(root / "rain" / "rain1.jpg")
+    _make_image(root / "rainbow" / "rainbow1.jpg")
+
+    with pytest.raises(ValueError, match="outside allowed labels"):
+        build_external_manifest(
+            image_root=root,
+            output_csv=tmp_path / "blocked.csv",
+            summary_json=tmp_path / "blocked.json",
+            dataset_name="external_test",
+            label_map={"rain": "rain", "rainbow": "rainbow"},
+            allowed_labels=["rain", "snow"],
+        )
+
+
+def test_external_manifest_uses_class_map_as_allowed_labels(tmp_path: Path) -> None:
+    import json
+    import pytest
+
+    from external_dataset_manifest import build_external_manifest, load_allowed_labels
+
+    class_map = tmp_path / "class_to_idx.json"
+    class_map.write_text(json.dumps({"rain": 0, "snow": 1}) + "\n", encoding="utf-8")
+    assert load_allowed_labels(allowed_labels=None, class_map=class_map) == ["rain", "snow"]
+
+    root = tmp_path / "external"
+    _make_image(root / "rain" / "rain1.jpg")
+    _make_image(root / "dew" / "dew1.jpg")
+
+    with pytest.raises(ValueError, match="outside allowed labels"):
+        build_external_manifest(
+            image_root=root,
+            output_csv=tmp_path / "blocked.csv",
+            summary_json=tmp_path / "blocked.json",
+            dataset_name="external_test",
+            label_map={"rain": "rain", "dew": "dew"},
+            allowed_labels=load_allowed_labels(allowed_labels=None, class_map=class_map),
+        )
+
+
+def test_external_manifest_class_map_is_authoritative_when_allowed_labels_are_set(tmp_path: Path) -> None:
+    import json
+    import pytest
+
+    from external_dataset_manifest import load_allowed_labels
+
+    class_map = tmp_path / "class_to_idx.json"
+    class_map.write_text(json.dumps({"rain": 0, "snow": 1}) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="outside class map"):
+        load_allowed_labels(allowed_labels=["rainbow"], class_map=class_map)
+
+
+def test_external_manifest_parse_args_accepts_class_map_and_allowed_labels(monkeypatch) -> None:
+    import sys
+
+    from external_dataset_manifest import parse_args
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "external_dataset_manifest.py",
+            "--image-root",
+            "images",
+            "--output-csv",
+            "external.csv",
+            "--summary-json",
+            "summary.json",
+            "--dataset-name",
+            "external_mwd",
+            "--class-map",
+            "class_to_idx.json",
+            "--allowed-labels",
+            "rain",
+            "snow",
+            "--allow-unbounded-labels",
+        ],
+    )
+
+    args = parse_args()
+
+    assert args.class_map == Path("class_to_idx.json")
+    assert args.allowed_labels == ["rain", "snow"]
+    assert args.allow_unbounded_labels is True
 
 
 def test_external_manifest_rejects_empty_mapped_label(tmp_path: Path) -> None:
@@ -105,6 +259,25 @@ def test_external_manifest_rejects_empty_mapped_label(tmp_path: Path) -> None:
             image_root=root,
             output_csv=tmp_path / "bad.csv",
             summary_json=tmp_path / "bad.json",
-            dataset_name="external",
+            dataset_name="external_test",
             label_map={"rain": ""},
+        )
+
+
+def test_external_manifest_rejects_reserved_dataset_names(tmp_path: Path) -> None:
+    import pytest
+
+    from external_dataset_manifest import build_external_manifest
+
+    root = tmp_path / "external"
+    _make_image(root / "rain" / "rain1.jpg")
+
+    with pytest.raises(ValueError, match="dataset_name must start with external_"):
+        build_external_manifest(
+            image_root=root,
+            output_csv=tmp_path / "bad.csv",
+            summary_json=tmp_path / "bad.json",
+            dataset_name="labeled",
+            label_map={"rain": "rain"},
+            allowed_labels=["rain"],
         )

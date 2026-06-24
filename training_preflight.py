@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -45,20 +46,49 @@ def _count_by_label(rows: list[ManifestRow]) -> dict[str, int]:
     return dict(sorted(counts.items()))
 
 
-def _validate_teacher_distillation(rows: list[ManifestRow], distillation_alpha: float) -> dict[str, object]:
+def _validate_teacher_distillation(
+    rows: list[ManifestRow],
+    distillation_alpha: float,
+    class_names: list[str],
+    allow_pseudo_teacher_distillation: bool,
+    pseudo_min_confidence: float | None,
+    pseudo_max_ratio: float | None,
+) -> dict[str, object]:
     has_teacher = [row.teacher_probs is not None for row in rows]
     if distillation_alpha > 0 and not all(has_teacher):
         missing = sum(1 for value in has_teacher if not value)
         raise ValueError(f"teacher distillation is enabled but {missing} rows are missing teacher probabilities")
     if any(has_teacher) and not all(has_teacher):
         raise ValueError("teacher probability columns must be present for every row or no rows")
+    bad_teacher_width = [
+        row.image_id or str(row.path)
+        for row in rows
+        if row.teacher_probs is not None and len(row.teacher_probs) != len(class_names)
+    ]
+    if bad_teacher_width:
+        raise ValueError(f"teacher probability width differs from class count for rows: {bad_teacher_width[:5]}")
     if distillation_alpha > 0:
-        non_labeled_sources = sorted({row.source for row in rows if row.source != "labeled"})
+        if allow_pseudo_teacher_distillation and (pseudo_min_confidence is None or pseudo_max_ratio is None):
+            raise ValueError(
+                "pseudo teacher distillation requires --pseudo-min-confidence and --pseudo-max-ratio"
+            )
+        allowed_sources = {"labeled", "pseudo"} if allow_pseudo_teacher_distillation else {"labeled"}
+        non_labeled_sources = sorted({row.source for row in rows if row.source not in allowed_sources})
         if non_labeled_sources:
             raise ValueError(
-                "teacher distillation preflight expects labeled rows only; "
+                "teacher distillation preflight found disallowed sources; "
                 f"found sources: {non_labeled_sources}"
             )
+        if allow_pseudo_teacher_distillation:
+            mismatched = []
+            for row in rows:
+                if row.source != "pseudo" or row.teacher_probs is None:
+                    continue
+                top1_idx = max(range(len(row.teacher_probs)), key=lambda idx: row.teacher_probs[idx])
+                if row.label is not None and top1_idx != row.label:
+                    mismatched.append(row.image_id or str(row.path))
+            if mismatched:
+                raise ValueError(f"pseudo teacher top1 differs from pseudo label for rows: {mismatched[:5]}")
     return {
         "enabled": distillation_alpha > 0,
         "rows_with_teacher": sum(1 for value in has_teacher if value),
@@ -99,6 +129,13 @@ def _validate_sources(
             preview = overweight[:5]
             raise ValueError(f"external sample_weight exceeds limit for rows: {preview}")
     pseudo_rows = source_counts.get("pseudo", 0)
+    invalid_pseudo_confidence = [
+        row.image_id or str(row.path)
+        for row in rows
+        if row.source == "pseudo" and (not math.isfinite(row.confidence) or row.confidence < 0 or row.confidence > 1)
+    ]
+    if invalid_pseudo_confidence:
+        raise ValueError(f"pseudo confidence must be finite and in [0, 1] for rows: {invalid_pseudo_confidence[:5]}")
     if pseudo_rows and external_rows:
         raise ValueError("pseudo labels and external data should not be mixed in the same first-pass training CSV")
     if pseudo_rows and pseudo_min_confidence is not None:
@@ -212,6 +249,7 @@ def run_preflight_checks(
     external_max_sample_weight: float | None = None,
     pseudo_min_confidence: float | None = None,
     pseudo_max_ratio: float | None = None,
+    allow_pseudo_teacher_distillation: bool = False,
     min_images_per_class: int = 1,
     inference_stats: Path | None = None,
     max_seconds_per_image: float | None = None,
@@ -245,7 +283,14 @@ def run_preflight_checks(
         pseudo_min_confidence=pseudo_min_confidence,
         pseudo_max_ratio=pseudo_max_ratio,
     )
-    teacher = _validate_teacher_distillation(rows, config.train.distillation_alpha)
+    teacher = _validate_teacher_distillation(
+        rows,
+        config.train.distillation_alpha,
+        class_names=idx_to_class(class_to_idx),
+        allow_pseudo_teacher_distillation=allow_pseudo_teacher_distillation,
+        pseudo_min_confidence=pseudo_min_confidence,
+        pseudo_max_ratio=pseudo_max_ratio,
+    )
     inference = _validate_inference_budget(
         inference_stats=inference_stats,
         max_seconds_per_image=max_seconds_per_image,
@@ -284,6 +329,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--external-max-sample-weight", type=float, default=None)
     parser.add_argument("--pseudo-min-confidence", type=float, default=None)
     parser.add_argument("--pseudo-max-ratio", type=float, default=None)
+    parser.add_argument("--allow-pseudo-teacher-distillation", action="store_true")
     parser.add_argument("--min-images-per-class", type=int, default=1)
     parser.add_argument("--inference-stats", type=Path, default=None)
     parser.add_argument("--max-seconds-per-image", type=float, default=None)
@@ -311,6 +357,7 @@ def main() -> None:
         external_max_sample_weight=args.external_max_sample_weight,
         pseudo_min_confidence=args.pseudo_min_confidence,
         pseudo_max_ratio=args.pseudo_max_ratio,
+        allow_pseudo_teacher_distillation=args.allow_pseudo_teacher_distillation,
         min_images_per_class=args.min_images_per_class,
         inference_stats=args.inference_stats,
         max_seconds_per_image=args.max_seconds_per_image,

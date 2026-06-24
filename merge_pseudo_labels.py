@@ -15,6 +15,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pseudo-csv", type=Path, required=True)
     parser.add_argument("--pseudo-image-root", type=Path, default=None)
     parser.add_argument("--min-confidence", type=float, default=0.95)
+    parser.add_argument("--allow-pseudo-teacher", action="store_true")
     parser.add_argument("--output", type=Path, default=Path("merged_train.csv"))
     return parser.parse_args()
 
@@ -29,6 +30,7 @@ def main() -> None:
         pseudo_image_root=args.pseudo_image_root,
         output_csv=args.output,
         min_confidence=args.min_confidence,
+        allow_pseudo_teacher=args.allow_pseudo_teacher,
     )
     print(json.dumps({**stats, "output": str(args.output)}, indent=2, ensure_ascii=False))
 
