@@ -16,6 +16,7 @@ from .data import (
 )
 from .datasets import WeatherImageDataset, build_transforms
 from .models import create_classifier
+from .postprocess import DecisionParams, load_decision_params
 from .submission import write_submission
 
 
@@ -74,6 +75,27 @@ def normalize_checkpoint_weights(
     return [float(weight) / total for weight in weights]
 
 
+def resolve_checkpoint_weights(
+    checkpoints: Sequence[Path],
+    cli_weights: Sequence[float] | None,
+    decision_params: DecisionParams | None,
+) -> list[float]:
+    if cli_weights is not None:
+        return normalize_checkpoint_weights(checkpoints, cli_weights)
+    if decision_params is None or decision_params.weights is None:
+        return normalize_checkpoint_weights(checkpoints, None)
+    if len(decision_params.weights) != len(checkpoints):
+        raise ValueError("decision params weights must match checkpoint count")
+    if decision_params.checkpoints is not None:
+        checkpoint_names = [str(path) for path in checkpoints]
+        if decision_params.checkpoints != checkpoint_names:
+            raise ValueError(
+                "decision params checkpoint order does not match --checkpoint; "
+                "pass explicit --weights to override"
+            )
+    return normalize_checkpoint_weights(checkpoints, decision_params.weights)
+
+
 def logit_entropy(logits: torch.Tensor) -> torch.Tensor:
     probabilities = torch.softmax(logits, dim=1)
     return -(probabilities * probabilities.clamp_min(1e-12).log()).sum(dim=1)
@@ -114,10 +136,11 @@ def predict_probabilities(
     num_workers: int = 2,
     checkpoint_weights: Sequence[float] | None = None,
     transform_backend: str = "auto",
+    decision_params_path: Path | None = None,
 ) -> tuple[list[Path], list[list[float]], list[str], list[str], dict[str, object]]:
     if not checkpoints:
         raise ValueError("At least one checkpoint is required")
-    weights = normalize_checkpoint_weights(checkpoints, checkpoint_weights)
+    decision_params = None
 
     models: list[torch.nn.Module] = []
     class_to_idx: dict[str, int] | None = None
@@ -132,6 +155,21 @@ def predict_probabilities(
 
     assert class_to_idx is not None
     class_names = idx_to_class(class_to_idx)
+    if decision_params_path is not None:
+        decision_params = load_decision_params(
+            decision_params_path,
+            expected_class_names=class_names,
+        )
+    weights = resolve_checkpoint_weights(
+        checkpoints=checkpoints,
+        cli_weights=checkpoint_weights,
+        decision_params=decision_params,
+    )
+    logit_bias = None
+    temperature = 1.0
+    if decision_params is not None:
+        temperature = decision_params.temperature
+        logit_bias = torch.tensor(decision_params.bias, dtype=torch.float32, device=device)
     dataset = WeatherImageDataset(
         rows,
         transform=build_transforms(
@@ -165,6 +203,9 @@ def predict_probabilities(
             for model, weight in zip(models, weights):
                 augmented_logits = augmented_logits + (model(flipped_images) * weight)
             logits = combine_tta_logits(logits, augmented_logits)
+        logits = logits / float(temperature)
+        if logit_bias is not None:
+            logits = logits + logit_bias
         probs = torch.softmax(logits, dim=1).cpu().tolist()
         probabilities.extend([[float(value) for value in row] for row in probs])
         image_paths.extend(Path(path) for path in paths)
@@ -178,6 +219,7 @@ def predict_probabilities(
         "checkpoints": [str(path) for path in checkpoints],
         "checkpoint_weights": weights,
         "tta": tta,
+        "decision_params": str(decision_params_path) if decision_params_path is not None else None,
     }
     return image_paths, probabilities, class_names, image_ids, stats
 
@@ -192,6 +234,7 @@ def predict_logits(
     num_workers: int = 2,
     checkpoint_weights: Sequence[float] | None = None,
     transform_backend: str = "auto",
+    decision_params_path: Path | None = None,
 ) -> tuple[list[Path], list[str], list[str], dict[str, object]]:
     image_paths, probabilities, class_names, image_ids, stats = predict_probabilities(
         checkpoints=checkpoints,
@@ -202,6 +245,7 @@ def predict_logits(
         num_workers=num_workers,
         checkpoint_weights=checkpoint_weights,
         transform_backend=transform_backend,
+        decision_params_path=decision_params_path,
     )
     predictions = [class_names[max(range(len(row)), key=lambda idx: row[idx])] for row in probabilities]
     return image_paths, predictions, image_ids, stats
@@ -223,6 +267,7 @@ def run_inference(
     sample_submission_path: Path | None = None,
     output_image_column: str = "image",
     output_label_column: str = "label",
+    decision_params_path: Path | None = None,
 ) -> dict[str, object]:
     rows = load_unlabeled_rows(
         test_dir=test_dir,
@@ -239,6 +284,7 @@ def run_inference(
         num_workers=num_workers,
         checkpoint_weights=checkpoint_weights,
         transform_backend=transform_backend,
+        decision_params_path=decision_params_path,
     )
     write_submission(
         output_path=output_csv,

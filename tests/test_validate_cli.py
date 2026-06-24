@@ -42,6 +42,8 @@ def test_infer_parse_args_accepts_submission_schema_controls(monkeypatch) -> Non
             "id",
             "--label-column",
             "weather",
+            "--decision-params",
+            "decision_params.json",
         ],
     )
 
@@ -50,3 +52,4 @@ def test_infer_parse_args_accepts_submission_schema_controls(monkeypatch) -> Non
     assert args.sample_submission == Path("sample_submission.csv")
     assert args.image_column == "id"
     assert args.label_column == "weather"
+    assert args.decision_params == Path("decision_params.json")

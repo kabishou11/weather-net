@@ -26,6 +26,7 @@ from .data import (
 from .datasets import WeatherImageDataset, build_transforms
 from .metrics import ClassificationReport, classification_report
 from .models import create_classifier
+from .oof import OofArtifactPaths, OofRecord, write_oof_artifacts
 
 
 def seed_everything(seed: int) -> None:
@@ -310,6 +311,73 @@ def evaluate(
     return classification_report(y_true, y_pred, class_names), total_loss / max(1, total_items)
 
 
+@torch.no_grad()
+def collect_oof_predictions(
+    model: nn.Module,
+    rows: Sequence[ManifestRow],
+    class_names: Sequence[str],
+    fold: int,
+    checkpoint: str,
+    model_name: str,
+    device: str,
+    image_size: int | None = None,
+    batch_size: int = 64,
+    num_workers: int = 2,
+    transform_backend: str = "auto",
+    loader: DataLoader | None = None,
+) -> list[OofRecord]:
+    model.eval()
+    if any(row.source == "pseudo" for row in rows):
+        raise ValueError("Pseudo rows must not be used as OOF validation rows")
+    if loader is None:
+        if image_size is None:
+            raise ValueError("image_size is required when loader is not provided")
+        dataset = WeatherImageDataset(
+            rows,
+            transform=build_transforms(
+                image_size=image_size,
+                train=False,
+                policy="standard",
+                backend=transform_backend,
+            ),
+        )
+        loader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=torch.cuda.is_available(),
+        )
+
+    records: list[OofRecord] = []
+    offset = 0
+    for images, targets, _sample_weights in loader:
+        images = images.to(device)
+        logits = model(images).detach().cpu().float()
+        targets = targets.detach().cpu().tolist()
+        batch_rows = rows[offset : offset + len(targets)]
+        for row, target, logit_row in zip(batch_rows, targets, logits.tolist()):
+            if row.label is None:
+                raise ValueError("OOF rows must be labeled")
+            true_idx = int(target)
+            true_label = row.label_name or class_names[true_idx]
+            records.append(
+                OofRecord(
+                    image_id=row.image_id or row.path.name,
+                    image_path=str(row.path),
+                    fold=fold,
+                    source=row.source,
+                    true_idx=true_idx,
+                    true_label=true_label,
+                    logits=[float(value) for value in logit_row],
+                    checkpoint=checkpoint,
+                    model_name=model_name,
+                )
+            )
+        offset += len(targets)
+    return records
+
+
 def save_checkpoint(
     path: Path,
     model: nn.Module,
@@ -343,8 +411,9 @@ def build_fold_summary(
     best_val_loss: float,
     checkpoint: str,
     report: ClassificationReport,
+    oof_artifacts: OofArtifactPaths | None = None,
 ) -> dict[str, object]:
-    return {
+    summary: dict[str, object] = {
         "fold": fold,
         "best_epoch": best_epoch,
         "best_macro_f1": report.macro_f1,
@@ -354,6 +423,15 @@ def build_fold_summary(
         "per_class_f1": report.per_class_f1,
         "confusion_matrix": report.confusion_matrix,
     }
+    if oof_artifacts is not None:
+        summary.update(
+            {
+                "oof_predictions_csv": str(oof_artifacts.csv_path),
+                "oof_probabilities_npz": str(oof_artifacts.npz_path),
+                "oof_metrics_json": str(oof_artifacts.metrics_path),
+            }
+        )
+    return summary
 
 
 def _fold_plan(
@@ -380,6 +458,7 @@ def train_config(config: AppConfig, device_request: str = "auto") -> list[Path]:
 
     checkpoint_paths: list[Path] = []
     summary: list[dict[str, object]] = []
+    all_oof_records: list[OofRecord] = []
     for fold, train_rows, val_rows in _fold_plan(
         rows,
         folds=config.data.folds,
@@ -462,6 +541,42 @@ def train_config(config: AppConfig, device_request: str = "auto") -> list[Path]:
         checkpoint_paths.append(best_path)
         if best_report is None:
             raise RuntimeError(f"No checkpoint was saved for fold {fold}")
+        best_model = create_classifier(
+            config.model.name,
+            num_classes=len(class_names),
+            pretrained=False,
+            drop_rate=config.model.dropout,
+        ).to(device)
+        best_checkpoint = torch.load(best_path, map_location=device)
+        best_model.load_state_dict(best_checkpoint["model_state"])
+        fold_oof_records = collect_oof_predictions(
+            model=best_model,
+            rows=val_rows,
+            class_names=class_names,
+            fold=fold,
+            checkpoint=str(best_path),
+            model_name=config.model.name,
+            device=device,
+            image_size=config.model.image_size,
+            batch_size=config.train.batch_size,
+            num_workers=config.data.num_workers,
+            transform_backend=config.data.transform_backend,
+        )
+        all_oof_records.extend(fold_oof_records)
+        fold_oof_artifacts = write_oof_artifacts(
+            output_dir=output_dir / "oof" / f"fold{fold}",
+            records=fold_oof_records,
+            class_names=class_names,
+            class_to_idx=class_to_idx,
+            metadata={
+                "fold": fold,
+                "checkpoint": str(best_path),
+                "model_name": config.model.name,
+                "image_size": config.model.image_size,
+                "transform_backend": config.data.transform_backend,
+                "seed": config.data.seed,
+            },
+        )
         summary.append(
             build_fold_summary(
                 fold=fold,
@@ -469,7 +584,25 @@ def train_config(config: AppConfig, device_request: str = "auto") -> list[Path]:
                 best_val_loss=best_val_loss,
                 checkpoint=str(best_path),
                 report=best_report,
+                oof_artifacts=fold_oof_artifacts,
             )
+        )
+
+    if all_oof_records:
+        write_oof_artifacts(
+            output_dir=output_dir / "oof",
+            records=all_oof_records,
+            class_names=class_names,
+            class_to_idx=class_to_idx,
+            metadata={
+                "folds_requested": config.data.folds,
+                "folds_actual": len(summary),
+                "seed": config.data.seed,
+                "model_name": config.model.name,
+                "image_size": config.model.image_size,
+                "transform_backend": config.data.transform_backend,
+                "checkpoints": [str(path) for path in checkpoint_paths],
+            },
         )
 
     (output_dir / "training_summary.json").write_text(

@@ -68,6 +68,49 @@ python3 infer.py \
 
 `--weights` 会对 logits 做归一化加权；不传时所有 checkpoint 等权平均。
 
+使用 OOF 决策参数推理：
+
+```bash
+python3 infer.py \
+  --checkpoint outputs/convnext_tiny/convnext_tiny_fold0.pt \
+  --test-dir data/test \
+  --decision-params outputs/decision/exp001/decision_params.json \
+  --sample-submission data/sample_submission.csv \
+  --output submission_exp001.csv
+```
+
+`decision_params.json` 会在 logits softmax 前应用 temperature 和 per-class bias；如果文件内含 `weights` 且命令行没有显式传 `--weights`，推理会使用该权重。
+
+## OOF 决策层
+
+训练会在 `output_dir/oof/` 下写出：
+
+```text
+oof_predictions.csv
+oof_probabilities.npz
+oof_metrics.json
+```
+
+基于 OOF 搜索 ensemble 权重、temperature 和 per-class bias：
+
+```bash
+python3 oof_decide.py \
+  --oof outputs/convnext_tiny/oof/oof_probabilities.npz \
+  --checkpoint outputs/convnext_tiny/convnext_tiny_fold0.pt \
+  --output-dir outputs/decision/exp001
+```
+
+多模型 OOF 决策：
+
+```bash
+python3 oof_decide.py \
+  --oof outputs/convnext_tiny/oof/oof_probabilities.npz outputs/fast_effnet/oof/oof_probabilities.npz \
+  --checkpoint outputs/convnext_tiny/convnext_tiny_fold0.pt outputs/fast_effnet/efficientnet_b0_fold0.pt \
+  --output-dir outputs/decision/exp002
+```
+
+输出的 `decision_params.json` 是提交前的冻结决策产物，避免只凭单次验证分数手填权重。
+
 ## 伪标签
 
 对未标注图片生成高置信伪标签：
