@@ -246,6 +246,22 @@ python3 classifier_rebalance.py \
 
 `classifier_rebalance.py` 会只调整 checkpoint 中 `classifier/head/fc.weight` 每个类别权重向量的范数，不改变权重方向，也不改变模型结构。它用于快速 A/B 长尾分类头去偏，推理成本为零；建议用 `tau=0.25/0.5/0.75/1.0` 网格在 OOF 或本地验证集上筛选，只有 macro F1 和低 F1 类别同时改善时再替换提交 checkpoint。若 checkpoint 中存在多个分类头候选，脚本会要求显式传 `--head-key`，避免自动改错头。
 
+cRT 分类头重训：
+
+```bash
+python3 classifier_rebalance.py \
+  --method crt \
+  --checkpoint outputs/convnextv2_384/convnextv2_tiny.fcmae_ft_in22k_in1k_fold0.pt \
+  --train-csv data/train.csv \
+  --image-root data/images \
+  --output outputs/convnextv2_384/convnextv2_tiny.fcmae_ft_in22k_in1k_fold0_crt.pt \
+  --epochs 4 \
+  --lr 0.001 \
+  --sampler-mode sqrt
+```
+
+`--method crt` 会加载已有 checkpoint，冻结 backbone，只训练分类头参数；训练数据会强制沿用 checkpoint 内的 `class_to_idx`，避免重新读 CSV 时类别顺序变化导致标签错位。默认用 `sqrt` 采样在类均衡和原分布之间折中，也可用 `class_balanced` 做更强尾类纠偏。该步骤训练成本很低、推理成本不变，适合在强 backbone 收敛后修正长尾类别决策边界。建议先对单 fold 或 OOF 最差类别对应 fold 快筛，再扩展到所有 fold；若大类 precision 明显下降，则回退到原 checkpoint 或 tau-norm。
+
 ## 伪标签
 
 对未标注图片生成高置信伪标签：
