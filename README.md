@@ -172,6 +172,8 @@ oof_metrics.json
 python3 oof_decide.py \
   --oof outputs/convnext_tiny/oof/oof_probabilities.npz \
   --checkpoint outputs/convnext_tiny/convnext_tiny_fold0.pt outputs/convnext_tiny/convnext_tiny_fold1.pt outputs/convnext_tiny/convnext_tiny_fold2.pt \
+  --nested \
+  --nested-min-delta-macro-f1 0.0 \
   --bootstrap-rounds 200 \
   --bootstrap-sample-fraction 0.8 \
   --bootstrap-min-delta-q05 0.0 \
@@ -189,7 +191,9 @@ python3 oof_decide.py \
 
 输出的 `decision_params.json` 是提交前的冻结决策产物，避免只凭单次验证分数手填权重。若 `oof_probabilities.npz` 来自 K 折训练，文件内会记录每条 OOF 预测对应的 fold checkpoint；`oof_decide.py` 会把 OOF 组权重自动展开为每个 fold checkpoint 的推理权重。线上推理时请传入同一组 fold checkpoint，顺序需与 `decision_params.json` 绑定一致。
 
-`--bootstrap-rounds` 会对 OOF 样本做分层有放回重采样，评估 per-class bias 相对 temperature-only 结果的稳定增益；若 `delta_q05_macro_f1` 低于 `--bootstrap-min-delta-q05`，会自动回退 bias，避免把 OOF 偶然性写进提交参数。这个步骤只影响决策参数搜索，不增加线上推理成本；不传 bootstrap 参数时保持旧行为，不启用门控。
+`--nested` 会强制读取 OOF 内的 `fold/source`，并要求所有 OOF 输入的 `image_id/y_true/class_names/fold/source` 完全对齐且 `source` 全为 `labeled`。它按外层 fold 做 held-out 评估：每次只在 `fold != k` 上搜索 weights、temperature 和 per-class bias，再把参数应用到 `fold == k`，最后用 pooled nested macro F1 判断 bias 是否可信。若 `nested_delta_tuned_vs_temperature_macro_f1` 低于 `--nested-min-delta-macro-f1`，最终 `decision_params.json` 会把 bias 回退为 0；全量 OOF 搜出的 weights/temperature 仍会保留。这个步骤不增加线上推理前向次数，只降低 OOF 调参同源虚高风险。
+
+`--bootstrap-rounds` 会对全量 OOF 样本做分层有放回重采样，评估 per-class bias 相对 temperature-only 结果的稳定增益；若 `delta_q05_macro_f1` 低于 `--bootstrap-min-delta-q05`，会自动回退 bias，避免把 OOF 偶然性写进提交参数。它是 full-OOF stability gate，不替代 nested held-out gate；两者同时开启时，任一 gate 拒绝都会让最终 bias 回退为 0。这个步骤只影响决策参数搜索，不增加线上推理成本；不传 bootstrap 参数时保持旧行为，不启用门控。
 
 基于 OOF 生成下一轮训练的 hard-sample 权重：
 
