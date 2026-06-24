@@ -41,7 +41,8 @@ class WeatherImageDataset(Dataset):
         sample_weight = float(row.sample_weight)
         if self.return_path:
             return image, label, str(row.path), row.image_id or row.path.name
-        return image, label, sample_weight
+        teacher_probs = torch.tensor(row.teacher_probs or (), dtype=torch.float32)
+        return image, label, sample_weight, teacher_probs
 
 
 class AlbumentationsAdapter:

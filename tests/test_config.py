@@ -105,6 +105,57 @@ def test_load_config_accepts_sample_weight_usage(tmp_path: Path) -> None:
     assert config.train.sample_weight_usage == "sampler"
 
 
+def test_load_config_accepts_distillation_options(tmp_path: Path) -> None:
+    from src.weather_net.config import load_config
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "train:\n"
+        "  distillation_alpha: 0.35\n"
+        "  distillation_temperature: 2.0\n",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert config.train.distillation_alpha == 0.35
+    assert config.train.distillation_temperature == 2.0
+
+
+def test_load_config_allows_distillation_combined_with_mixup(tmp_path: Path) -> None:
+    from src.weather_net.config import load_config
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "train:\n"
+        "  distillation_alpha: 0.4\n"
+        "  mixup_alpha: 0.2\n",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert config.train.distillation_alpha == 0.4
+    assert config.train.mixup_alpha == 0.2
+
+
+def test_load_config_rejects_invalid_distillation_options(tmp_path: Path) -> None:
+    import pytest
+
+    from src.weather_net.config import load_config
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "train:\n"
+        "  distillation_alpha: 1.2\n"
+        "  distillation_temperature: 0.0\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="distillation_alpha"):
+        load_config(config_path)
+
+
 def test_load_config_accepts_balanced_softmax_loss(tmp_path: Path) -> None:
     from src.weather_net.config import load_config
 

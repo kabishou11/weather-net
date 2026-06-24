@@ -42,6 +42,72 @@ def test_csv_manifest_respects_existing_class_mapping(tmp_path: Path) -> None:
     assert all(row.path.is_absolute() for row in manifest)
 
 
+def test_csv_manifest_reads_teacher_probability_columns(tmp_path: Path) -> None:
+    from src.weather_net.data import build_manifest_from_csv
+
+    _make_image(tmp_path / "images" / "rain.jpg")
+    _make_image(tmp_path / "images" / "sunny.jpg")
+    csv_path = tmp_path / "train.csv"
+    csv_path.write_text(
+        "image,label,teacher_rain,teacher_sunny\n"
+        "rain.jpg,rain,0.8,0.2\n"
+        "sunny.jpg,sunny,0.1,0.9\n",
+        encoding="utf-8",
+    )
+
+    manifest, class_to_idx = build_manifest_from_csv(
+        csv_path,
+        image_root=tmp_path / "images",
+        class_to_idx={"rain": 0, "sunny": 1},
+    )
+
+    assert class_to_idx == {"rain": 0, "sunny": 1}
+    assert manifest[0].teacher_probs == (0.8, 0.2)
+    assert manifest[1].teacher_probs == (0.1, 0.9)
+
+
+def test_csv_manifest_rejects_invalid_teacher_probability_columns(tmp_path: Path) -> None:
+    import pytest
+
+    from src.weather_net.data import build_manifest_from_csv
+
+    _make_image(tmp_path / "images" / "rain.jpg")
+    csv_path = tmp_path / "train.csv"
+    csv_path.write_text(
+        "image,label,teacher_rain,teacher_sunny\n"
+        "rain.jpg,rain,0.9,0.9\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="teacher"):
+        build_manifest_from_csv(
+            csv_path,
+            image_root=tmp_path / "images",
+            class_to_idx={"rain": 0, "sunny": 1},
+        )
+
+
+def test_csv_manifest_requires_all_teacher_probability_columns(tmp_path: Path) -> None:
+    import pytest
+
+    from src.weather_net.data import build_manifest_from_csv
+
+    _make_image(tmp_path / "images" / "rain.jpg")
+    csv_path = tmp_path / "train.csv"
+    csv_path.write_text(
+        "image,label,teacher_rain\n"
+        "rain.jpg,rain,1.0\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="missing classes"):
+        build_manifest_from_csv(
+            csv_path,
+            image_root=tmp_path / "images",
+            class_to_idx={"rain": 0, "sunny": 1},
+        )
+
+
 def test_training_csv_prefers_filename_over_id_primary_key(tmp_path: Path) -> None:
     from src.weather_net.data import build_manifest_from_csv
 

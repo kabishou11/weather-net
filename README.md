@@ -406,6 +406,70 @@ python3 train.py \
   --output-dir outputs/convnext_pseudo
 ```
 
+## OOF teacher distillation
+
+训练 CSV 可选加入按类别命名的 teacher soft label 列：
+
+```csv
+image,label,teacher_cloudy,teacher_rain,teacher_shine,teacher_sunrise
+0001.jpg,rain,0.02,0.94,0.03,0.01
+```
+
+列名必须是 `teacher_{class_name}`，且覆盖 `class_to_idx` 中的每个类别；每行概率必须非负、有限、和为 1。建议 teacher 只来自 OOF 模型、不同架构 ensemble 或独立 teacher，不能用同一 fold 的学生模型预测自己的训练样本，否则本地 F1 会被泄漏污染。
+
+配置示例：
+
+```yaml
+train:
+  distillation_alpha: 0.3
+  distillation_temperature: 2.0
+```
+
+`distillation_alpha` 控制监督标签和 teacher KL 的混合比例。该路径支持 MixUp/CutMix：训练时会用同一个 `lam/permutation` 同步混合 teacher soft label 和样本权重，避免“图像混了但软标签没混”的目标错位。若使用 `augmix_jsd`，teacher KL 只作用在 clean view，JSD consistency 仍约束 clean/aug views。
+
+## 外部公开数据
+
+已验证可下载的数据源：
+
+- MWD / Multi-class Weather Dataset：Kaggle `pratik2901/multiclass-weather-dataset`，1125 张，Kaggle 标 CC BY 4.0，类别映射后为 `cloudy/rain/sunny`。
+- WEAPD mirror / Weather Image Recognition：Kaggle `jehanbhathena/weather-dataset`，6862 张，Kaggle 标 CC0，类别映射后为 `dew/fog/lightning/rain/rainbow/sandstorm/snow`。
+
+下载示例：
+
+```bash
+mkdir -p data/external/mwd_kaggle data/external/weapd_kaggle
+curl -L --fail --retry 3 \
+  -o data/external/mwd_kaggle/multiclass-weather-dataset.zip \
+  https://www.kaggle.com/api/v1/datasets/download/pratik2901/multiclass-weather-dataset
+curl -L --fail --retry 3 \
+  -o data/external/weapd_kaggle/weather-dataset.zip \
+  https://www.kaggle.com/api/v1/datasets/download/jehanbhathena/weather-dataset
+unzip -q -o data/external/mwd_kaggle/multiclass-weather-dataset.zip -d data/external/mwd_kaggle
+unzip -q -o data/external/weapd_kaggle/weather-dataset.zip -d data/external/weapd_kaggle
+```
+
+生成外部 CSV：
+
+```bash
+python3 external_dataset_manifest.py \
+  --image-root "data/external/mwd_kaggle/Multi-class Weather Dataset" \
+  --dataset-name external_mwd \
+  --label-map-preset mwd \
+  --output-csv data/external/mwd_kaggle/external_train.csv \
+  --summary-json data/external/mwd_kaggle/summary.json
+
+python3 external_dataset_manifest.py \
+  --image-root data/external/weapd_kaggle/dataset \
+  --dataset-name external_weapd \
+  --label-map-preset weapd \
+  --output-csv data/external/weapd_kaggle/external_train.csv \
+  --summary-json data/external/weapd_kaggle/summary.json
+```
+
+如果官方类别不包含 `dew/lightning/rainbow/sandstorm` 这类标签，用自定义 JSON 映射并开启 `--drop-unmapped`，只保留能对齐官方类别的样本。
+
+外部数据默认不直接等权并入官方训练集。推荐用法是：先按官方类别过滤，再加 `source=external` 和低 `sample_weight`，或只导出 DINOv2/CLIP/timm embedding 给 `embedding_guard.py` 做伪标签语义裁判。若比赛规则禁止外部数据，则这些数据只能用于本地鲁棒性分析，不进入最终训练。
+
 ## 四天冲分顺序
 
 1. 先用 `convnext_tiny` 跑通单模型，保存 `class_to_idx.json` 和 best checkpoint。

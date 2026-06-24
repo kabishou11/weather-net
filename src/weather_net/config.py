@@ -53,6 +53,8 @@ class TrainConfig:
     mixup_alpha: float = 0.2
     cutmix_alpha: float = 0.0
     jsd_weight: float = 0.0
+    distillation_alpha: float = 0.0
+    distillation_temperature: float = 1.0
     ema_decay: float = 0.0
     output_dir: Path = Path("outputs")
 
@@ -144,6 +146,10 @@ def _validate_config(config: AppConfig) -> None:
         raise ValueError("train.mixup_alpha and train.cutmix_alpha must be non-negative")
     if config.train.jsd_weight < 0:
         raise ValueError("train.jsd_weight must be non-negative")
+    if config.train.distillation_alpha < 0 or config.train.distillation_alpha > 1:
+        raise ValueError("train.distillation_alpha must be in [0, 1]")
+    if config.train.distillation_temperature <= 0:
+        raise ValueError("train.distillation_temperature must be positive")
     if config.data.augment_policy == "augmix_jsd":
         if config.train.jsd_weight <= 0:
             raise ValueError("train.jsd_weight must be positive when data.augment_policy is augmix_jsd")

@@ -20,6 +20,7 @@ class ManifestRow:
     source: str = "labeled"
     confidence: float = 1.0
     sample_weight: float = 1.0
+    teacher_probs: tuple[float, ...] | None = None
 
 
 def is_image_file(path: Path) -> bool:
@@ -125,6 +126,16 @@ def build_manifest_from_csv(
     source_column = next((name for name in fieldnames if name.lower() == "source"), None)
     confidence_column = next((name for name in fieldnames if name.lower() == "confidence"), None)
     sample_weight_column = next((name for name in fieldnames if name.lower() == "sample_weight"), None)
+    teacher_columns = {
+        name[len("teacher_") :]: name
+        for name in fieldnames
+        if name.lower().startswith("teacher_")
+    }
+    ordered_class_names = idx_to_class(class_to_idx)
+    if teacher_columns:
+        missing_teacher = [name for name in ordered_class_names if name not in teacher_columns]
+        if missing_teacher:
+            raise ValueError(f"CSV teacher probability columns missing classes: {missing_teacher}")
 
     manifest: list[ManifestRow] = []
     for row in rows:
@@ -140,6 +151,17 @@ def build_manifest_from_csv(
             sample_weight = 1.0
         if not math.isfinite(sample_weight) or sample_weight <= 0:
             raise ValueError(f"sample_weight must be finite and positive: {image_id}")
+        teacher_probs: tuple[float, ...] | None = None
+        if teacher_columns:
+            values = [float(row[teacher_columns[class_name]]) for class_name in ordered_class_names]
+            if not all(math.isfinite(value) for value in values):
+                raise ValueError(f"teacher probabilities must be finite: {image_id}")
+            if any(value < 0 for value in values):
+                raise ValueError(f"teacher probabilities must be non-negative: {image_id}")
+            total = sum(values)
+            if not math.isclose(total, 1.0, rel_tol=1e-4, abs_tol=1e-4):
+                raise ValueError(f"teacher probabilities must sum to 1: {image_id}")
+            teacher_probs = tuple(float(value) for value in values)
         manifest.append(
             ManifestRow(
                 path=(image_root / image_id).resolve(),
@@ -149,6 +171,7 @@ def build_manifest_from_csv(
                 source=source,
                 confidence=confidence,
                 sample_weight=sample_weight,
+                teacher_probs=teacher_probs,
             )
         )
     return manifest, dict(class_to_idx)

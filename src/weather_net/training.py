@@ -6,7 +6,7 @@ import random
 import re
 import time
 from copy import deepcopy
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Iterable, Sequence
 
@@ -77,6 +77,12 @@ class ModelEma:
                 ema_value.mul_(self.decay).add_(model_value, alpha=1.0 - self.decay)
             else:
                 ema_value.copy_(model_value)
+
+
+@dataclass(frozen=True)
+class BatchAugmentationInfo:
+    permutation: torch.Tensor | None
+    lam: float = 1.0
 
 
 def make_sampler(
@@ -231,6 +237,18 @@ def _one_hot_targets(targets: torch.Tensor, num_classes: int) -> torch.Tensor:
     return torch.nn.functional.one_hot(targets, num_classes=num_classes).float()
 
 
+def unpack_training_batch(batch) -> tuple[torch.Tensor | tuple, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    if len(batch) == 3:
+        images, targets, sample_weights = batch
+        return images, targets, sample_weights, None
+    if len(batch) == 4:
+        images, targets, sample_weights, teacher_probs = batch
+        if isinstance(teacher_probs, torch.Tensor) and teacher_probs.numel() == 0:
+            teacher_probs = None
+        return images, targets, sample_weights, teacher_probs
+    raise ValueError("training batches must contain 3 or 4 items")
+
+
 def _mixup_batch(
     images: torch.Tensor,
     targets: torch.Tensor,
@@ -294,7 +312,13 @@ def apply_batch_augmentations(
     cutmix_alpha: float,
     sample_weights: torch.Tensor | None = None,
     force_mode: str | None = None,
-) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return_mix_info: bool = False,
+) -> (
+    tuple[torch.Tensor, torch.Tensor]
+    | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    | tuple[torch.Tensor, torch.Tensor, BatchAugmentationInfo]
+    | tuple[torch.Tensor, torch.Tensor, torch.Tensor, BatchAugmentationInfo]
+):
     return_weights = sample_weights is not None
 
     def _with_optional_weights(
@@ -302,17 +326,30 @@ def apply_batch_augmentations(
         soft_targets: torch.Tensor,
         permutation: torch.Tensor | None = None,
         lam: float = 1.0,
-    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> (
+        tuple[torch.Tensor, torch.Tensor]
+        | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        | tuple[torch.Tensor, torch.Tensor, BatchAugmentationInfo]
+        | tuple[torch.Tensor, torch.Tensor, torch.Tensor, BatchAugmentationInfo]
+    ):
+        mix_info = BatchAugmentationInfo(permutation=permutation, lam=float(lam))
         if not return_weights:
+            if return_mix_info:
+                return mixed_images, soft_targets, mix_info
             return mixed_images, soft_targets
         assert sample_weights is not None
         if permutation is None:
-            return mixed_images, soft_targets, soft_targets * sample_weights.unsqueeze(1)
+            weighted_targets = soft_targets * sample_weights.unsqueeze(1)
+            if return_mix_info:
+                return mixed_images, soft_targets, weighted_targets, mix_info
+            return mixed_images, soft_targets, weighted_targets
         hard_targets = _one_hot_targets(targets, num_classes)
         weighted_targets = (
             (float(lam) * hard_targets * sample_weights.unsqueeze(1))
             + ((1.0 - float(lam)) * hard_targets[permutation] * sample_weights[permutation].unsqueeze(1))
         )
+        if return_mix_info:
+            return mixed_images, soft_targets, weighted_targets, mix_info
         return mixed_images, soft_targets, weighted_targets
 
     if force_mode not in {None, "none", "mixup", "cutmix"}:
@@ -436,6 +473,54 @@ def weighted_soft_cross_entropy(
     return losses.sum() / normalizer.sum().clamp_min(1e-8)
 
 
+def distillation_kl_loss(
+    logits: torch.Tensor,
+    teacher_probs: torch.Tensor,
+    alpha: float,
+    temperature: float = 1.0,
+    sample_weights: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if alpha < 0 or alpha > 1:
+        raise ValueError("distillation_alpha must be in [0, 1]")
+    if temperature <= 0:
+        raise ValueError("distillation_temperature must be positive")
+    if teacher_probs.ndim != 2 or teacher_probs.shape != logits.shape:
+        raise ValueError("teacher_probs must match logits shape")
+    teacher_probs = teacher_probs.to(logits.device, dtype=logits.dtype)
+    if not torch.isfinite(teacher_probs).all():
+        raise ValueError("teacher_probs must be finite")
+    if (teacher_probs < 0).any():
+        raise ValueError("teacher_probs must be non-negative")
+    row_sums = teacher_probs.sum(dim=1)
+    if not torch.allclose(row_sums, torch.ones_like(row_sums), rtol=1e-4, atol=1e-4):
+        raise ValueError("teacher_probs rows must sum to 1")
+    log_probs = torch.nn.functional.log_softmax(logits / float(temperature), dim=1)
+    losses = torch.nn.functional.kl_div(log_probs, teacher_probs, reduction="none").sum(dim=1)
+    losses = losses * (float(temperature) ** 2) * float(alpha)
+    if sample_weights is not None:
+        sample_weights = sample_weights.to(logits.device, dtype=logits.dtype)
+        return (losses * sample_weights).sum() / sample_weights.sum().clamp_min(1e-8)
+    return losses.mean()
+
+
+def mix_teacher_probabilities(
+    teacher_probs: torch.Tensor,
+    sample_weights: torch.Tensor,
+    mix_info: BatchAugmentationInfo,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if mix_info.permutation is None:
+        return teacher_probs, sample_weights
+    lam = float(mix_info.lam)
+    permutation = mix_info.permutation.to(teacher_probs.device)
+    mixed_weights = (lam * sample_weights) + ((1.0 - lam) * sample_weights[permutation])
+    weighted_teacher = (
+        (lam * teacher_probs * sample_weights.unsqueeze(1))
+        + ((1.0 - lam) * teacher_probs[permutation] * sample_weights[permutation].unsqueeze(1))
+    )
+    mixed_teacher = weighted_teacher / mixed_weights.unsqueeze(1).clamp_min(1e-8)
+    return mixed_teacher, mixed_weights
+
+
 def balanced_softmax_cross_entropy(
     logits: torch.Tensor,
     soft_targets: torch.Tensor,
@@ -546,6 +631,8 @@ def train_one_epoch(
     ldam_scale: float = 30.0,
     model_ema: ModelEma | None = None,
     jsd_weight: float = 0.0,
+    distillation_alpha: float = 0.0,
+    distillation_temperature: float = 1.0,
 ) -> float:
     model.train()
     total_loss = 0.0
@@ -567,12 +654,17 @@ def train_one_epoch(
 
     if jsd_weight < 0:
         raise ValueError("jsd_weight must be non-negative")
+    if distillation_alpha < 0 or distillation_alpha > 1:
+        raise ValueError("distillation_alpha must be in [0, 1]")
+    if distillation_temperature <= 0:
+        raise ValueError("distillation_temperature must be positive")
     if use_balanced_softmax and class_counts is None:
         raise ValueError("class_counts is required when loss_name is balanced_softmax")
     if use_ldam and ldam_margins is None:
         raise ValueError("ldam_margins is required when loss_name is ldam")
 
-    for images, targets, sample_weights in loader:
+    for batch in loader:
+        images, targets, sample_weights, teacher_probs = unpack_training_batch(batch)
         images, augmix_views = split_augmix_jsd_batch(images)
         if jsd_weight > 0 and not augmix_views:
             raise ValueError("jsd_weight requires augmix_jsd batches with three image views")
@@ -580,19 +672,29 @@ def train_one_epoch(
         augmix_views = [view.to(device, non_blocking=True) for view in augmix_views]
         targets = targets.to(device, non_blocking=True)
         sample_weights = sample_weights.to(device, non_blocking=True)
+        if teacher_probs is not None:
+            teacher_probs = teacher_probs.to(device, non_blocking=True)
         optimizer.zero_grad(set_to_none=True)
         with torch.autocast(device_type="cuda", enabled=use_amp):
+            distillation_sample_weights = sample_weights
             if augmix_views and (mixup_alpha > 0 or cutmix_alpha > 0):
                 raise ValueError("augmix_jsd batches are intentionally mutually exclusive with MixUp/CutMix")
             if mixup_alpha > 0 or cutmix_alpha > 0:
-                images, soft_targets, weighted_targets = apply_batch_augmentations(
+                images, soft_targets, weighted_targets, mix_info = apply_batch_augmentations(
                     images,
                     targets,
                     num_classes=num_classes,
                     mixup_alpha=mixup_alpha,
                     cutmix_alpha=cutmix_alpha,
                     sample_weights=sample_weights,
+                    return_mix_info=True,
                 )
+                if teacher_probs is not None:
+                    teacher_probs, distillation_sample_weights = mix_teacher_probabilities(
+                        teacher_probs,
+                        sample_weights,
+                        mix_info,
+                    )
                 soft_targets = _apply_label_smoothing(soft_targets, label_smoothing)
                 weighted_targets = _apply_weighted_label_smoothing(weighted_targets, label_smoothing)
                 logits = model(images)
@@ -659,6 +761,14 @@ def train_one_epoch(
                 aug1_logits = model(augmix_views[0])
                 aug2_logits = model(augmix_views[1])
                 loss = loss + (jsd_weight * augmix_jsd_loss(logits, aug1_logits, aug2_logits, sample_weights))
+            if teacher_probs is not None and distillation_alpha > 0:
+                loss = ((1.0 - float(distillation_alpha)) * loss) + distillation_kl_loss(
+                    logits,
+                    teacher_probs,
+                    alpha=float(distillation_alpha),
+                    temperature=distillation_temperature,
+                    sample_weights=distillation_sample_weights,
+                )
         scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
@@ -690,7 +800,8 @@ def evaluate(
     total_loss = 0.0
     total_items = 0
     criterion = nn.CrossEntropyLoss(reduction="none")
-    for images, targets, sample_weights in loader:
+    for batch in loader:
+        images, targets, sample_weights, _teacher_probs = unpack_training_batch(batch)
         images = images.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
         sample_weights = sample_weights.to(device, non_blocking=True)
@@ -744,7 +855,8 @@ def collect_oof_predictions(
 
     records: list[OofRecord] = []
     offset = 0
-    for images, targets, _sample_weights in loader:
+    for batch in loader:
+        images, targets, _sample_weights, _teacher_probs = unpack_training_batch(batch)
         images = images.to(device, non_blocking=True)
         logits = model(images).detach().cpu().float()
         targets = targets.detach().cpu().tolist()
@@ -938,6 +1050,8 @@ def train_config(config: AppConfig, device_request: str = "auto") -> list[Path]:
                 ldam_scale=config.train.ldam_scale,
                 model_ema=model_ema,
                 jsd_weight=config.train.jsd_weight,
+                distillation_alpha=config.train.distillation_alpha,
+                distillation_temperature=config.train.distillation_temperature,
             )
             eval_model = model_ema.module if model_ema is not None else model
             report, val_loss = evaluate(eval_model, val_loader, device=device, class_names=class_names)

@@ -14,6 +14,13 @@
 - `huggingface/pytorch-image-models`：模型创建和预训练权重来源。
 - 常见 GitHub 天气分类 notebook/仓库：仅参考数据分析、混淆矩阵和错误样本分析思路。
 
+## 外部公开数据集
+
+- Multi-class Weather Dataset (MWD)：Kaggle `pratik2901/multiclass-weather-dataset`，来源关联 Mendeley Data DOI `10.17632/4drtyfjtfy.1`，Kaggle 标注 License: CC BY 4.0。项目已下载到 `data/external/mwd_kaggle/`，生成 `external_train.csv` 与 `summary.json`，仅作为外部公开数据候选或离线语义裁判数据，使用时需保留署名。
+- Weather Image Recognition / WEAPD mirror：Kaggle `jehanbhathena/weather-dataset`，描述引用 Harvard Dataverse DOI `10.7910/DVN/M8JQCR`，Kaggle 标注 License: CC0 Public Domain。项目已下载到 `data/external/weapd_kaggle/`，生成 `external_train.csv` 与 `summary.json`，适合补充雾、雨、雪、冰雹等复杂天气外部候选数据。正式训练前必须按官方比赛类别过滤或低权重合并，避免外部类别先验污染。
+
+外部数据不应自动进入最终训练。只有在比赛规则允许公开外部数据时，才可用 `external_dataset_manifest.py` 生成的 CSV 经类别映射、每类 cap 和样本权重门控后合并；不确定时只用于离线 embedding guard、错误分析或本地鲁棒性评估。
+
 ## 论文方法参考
 
 - Focal Loss：参考 Lin et al., "Focal Loss for Dense Object Detection"，用于降低易分类样本权重，让训练更关注难样本。

@@ -229,6 +229,131 @@ def test_make_loaders_sample_weight_usage_both_keeps_sampler_and_loss_weights(tm
     assert train_loader.dataset.rows[1].sample_weight == 2.5
 
 
+def test_weather_image_dataset_returns_teacher_probabilities(tmp_path: Path) -> None:
+    from PIL import Image
+
+    from src.weather_net.data import ManifestRow
+    from src.weather_net.datasets import WeatherImageDataset
+
+    image_path = tmp_path / "rain.jpg"
+    Image.new("RGB", (8, 8), (32, 64, 96)).save(image_path)
+    dataset = WeatherImageDataset(
+        [ManifestRow(path=image_path, label=0, teacher_probs=(0.8, 0.2))],
+        transform=lambda image: torch.zeros(3, 8, 8),
+    )
+
+    image, label, sample_weight, teacher_probs = dataset[0]
+
+    assert image.shape == (3, 8, 8)
+    assert label == 0
+    assert sample_weight == 1.0
+    assert torch.allclose(teacher_probs, torch.tensor([0.8, 0.2]))
+
+
+def test_distillation_kl_loss_respects_alpha_and_temperature() -> None:
+    from src.weather_net.training import distillation_kl_loss
+
+    logits = torch.tensor([[2.0, -1.0]], requires_grad=True)
+    teacher_probs = torch.tensor([[0.1, 0.9]])
+
+    loss = distillation_kl_loss(
+        logits,
+        teacher_probs,
+        alpha=0.5,
+        temperature=2.0,
+    )
+    loss.backward()
+
+    assert loss.item() > 0
+    assert logits.grad is not None
+    assert logits.grad[0, 1] < 0
+
+
+def test_train_one_epoch_applies_teacher_distillation_loss() -> None:
+    from torch import nn
+    from torch.utils.data import DataLoader, TensorDataset
+
+    from src.weather_net.training import train_one_epoch
+
+    model = nn.Linear(2, 2, bias=False)
+    model.weight.data = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+    images = torch.tensor([[2.0, 0.0], [2.0, 0.0]])
+    targets = torch.tensor([0, 0])
+    sample_weights = torch.ones(2)
+    teacher_probs = torch.tensor([[0.1, 0.9], [0.1, 0.9]])
+    loader = DataLoader(TensorDataset(images, targets, sample_weights, teacher_probs), batch_size=2)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    scaler = torch.amp.GradScaler("cuda", enabled=False)
+
+    before_class1 = model.weight.detach()[1, 0].item()
+    loss = train_one_epoch(
+        model,
+        loader,
+        optimizer,
+        scaler,
+        device="cpu",
+        num_classes=2,
+        label_smoothing=0.0,
+        mixup_alpha=0.0,
+        cutmix_alpha=0.0,
+        amp=False,
+        distillation_alpha=0.8,
+        distillation_temperature=2.0,
+    )
+
+    assert loss > 0
+    assert model.weight.detach()[1, 0].item() > before_class1
+
+
+def test_train_one_epoch_mixes_teacher_probs_with_mixup(monkeypatch) -> None:
+    from torch import nn
+    from torch.utils.data import DataLoader, TensorDataset
+
+    from src.weather_net import training
+
+    model = nn.Linear(2, 2)
+    images = torch.randn(2, 2)
+    targets = torch.tensor([0, 1])
+    sample_weights = torch.ones(2)
+    teacher_probs = torch.tensor([[0.9, 0.1], [0.2, 0.8]])
+    loader = DataLoader(TensorDataset(images, targets, sample_weights, teacher_probs), batch_size=2)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    scaler = torch.amp.GradScaler("cuda", enabled=False)
+    captured = {}
+
+    def fake_distillation_kl_loss(logits, observed_teacher_probs, **kwargs):
+        captured["teacher_probs"] = observed_teacher_probs.detach().cpu()
+        return logits.sum() * 0.0
+
+    monkeypatch.setattr(training.np.random, "beta", lambda _alpha, _beta: 0.25)
+    monkeypatch.setattr(
+        training.torch,
+        "randperm",
+        lambda _size, device=None: torch.tensor([1, 0], device=device),
+    )
+    monkeypatch.setattr(training, "distillation_kl_loss", fake_distillation_kl_loss)
+
+    training.train_one_epoch(
+        model,
+        loader,
+        optimizer,
+        scaler,
+        device="cpu",
+        num_classes=2,
+        label_smoothing=0.0,
+        mixup_alpha=1.0,
+        cutmix_alpha=0.0,
+        amp=False,
+        distillation_alpha=0.5,
+        distillation_temperature=2.0,
+    )
+
+    assert torch.allclose(
+        captured["teacher_probs"],
+        torch.tensor([[0.375, 0.625], [0.725, 0.275]]),
+    )
+
+
 def test_build_optimizer_uses_no_decay_for_bias_norm_and_one_dimensional_params() -> None:
     from torch import nn
 
