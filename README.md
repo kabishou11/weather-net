@@ -469,26 +469,31 @@ train:
 
 ## 外部公开数据
 
-已验证可下载的数据源：
+本机 `/Volumes/T9/天气数据集` 已有 3 个 Kaggle zip，优先用本地包，不需要再盲目找数据集：
 
-- MWD / Multi-class Weather Dataset：Kaggle `pratik2901/multiclass-weather-dataset`，1125 张，Kaggle 标 CC BY 4.0，类别映射后为 `cloudy/rain/sunny`。
-- WEAPD mirror / Weather Image Recognition：Kaggle `jehanbhathena/weather-dataset`，6862 张，Kaggle 标 CC0，类别映射后为 `dew/fog/lightning/rain/rainbow/sandstorm/snow`。
+- Road Weather-Time / CCF BDCI road images：`wjybuqi-weathertime-classification-with-road-images.zip`，`train.json` 实测 2600 张人工标注道路图，当前训练标注为 `cloudy 1119 / rainy 595 / sunny 886`，`test_images 400` 永不进训练。它最贴近交通气象/自动驾驶域，建议第一优先级做低权重外部训练 A/B。
+- Vijay multiclass weather：`vijaygiitk-multiclass-weather-dataset.zip`，1500 张 ImageFolder，`cloudy/foggy/rainy/shine/sunrise` 分别为 `300/300/300/250/350`，另有 `alien_test 30` 和 `test.csv`。它可低权重补充或导 embedding，不要把 `alien_test` 当真标注。
+- MWD / Multi-class Weather Dataset：当前已解压为 `data/external/mwd_kaggle`，1125 张，类别映射后为 `cloudy 300 / rain 215 / sunny 610`。
+- WEAPD mirror / Weather Image Recognition：当前已解压为 `data/external/weapd_kaggle`，6862 张，Kaggle 标 CC0，类别映射后为 `dew/fog/lightning/rain/rainbow/sandstorm/snow`。其中 `frost/glaze/hail/rime/snow` 合并后 `snow 3486`，语义噪声很重，优先做 embedding guard/异常分析或极低权重补尾类。
 
-下载示例：
+Road Weather-Time JSON manifest：
 
 ```bash
-mkdir -p data/external/mwd_kaggle data/external/weapd_kaggle
-curl -L --fail --retry 3 \
-  -o data/external/mwd_kaggle/multiclass-weather-dataset.zip \
-  https://www.kaggle.com/api/v1/datasets/download/pratik2901/multiclass-weather-dataset
-curl -L --fail --retry 3 \
-  -o data/external/weapd_kaggle/weather-dataset.zip \
-  https://www.kaggle.com/api/v1/datasets/download/jehanbhathena/weather-dataset
-unzip -q -o data/external/mwd_kaggle/multiclass-weather-dataset.zip -d data/external/mwd_kaggle
-unzip -q -o data/external/weapd_kaggle/weather-dataset.zip -d data/external/weapd_kaggle
+python3 external_dataset_manifest.py \
+  --format road-weather-time \
+  --annotation-json data/external/road_weather_time_kaggle/train_dataset/train.json \
+  --image-root data/external/road_weather_time_kaggle/train_dataset \
+  --dataset-name external_road_weather_time \
+  --dataset-url "https://www.kaggle.com/datasets/wjybuqi/weathertime-classification-with-road-images" \
+  --license "Kaggle dataset; verify competition terms before redistribution" \
+  --label-map-preset road_weather_time \
+  --class-map outputs/convnextv2_384/class_to_idx.json \
+  --sample-weight 0.5 \
+  --output-csv data/external/road_weather_time_kaggle/external_train.csv \
+  --summary-json data/external/road_weather_time_kaggle/summary.json
 ```
 
-生成外部 CSV：
+ImageFolder 外部 CSV：
 
 ```bash
 python3 external_dataset_manifest.py \
@@ -499,8 +504,21 @@ python3 external_dataset_manifest.py \
   --doi 10.17632/4drtyfjtfy.1 \
   --label-map-preset mwd \
   --class-map outputs/convnextv2_384/class_to_idx.json \
+  --sample-weight 0.3 \
   --output-csv data/external/mwd_kaggle/external_train.csv \
   --summary-json data/external/mwd_kaggle/summary.json
+
+python3 external_dataset_manifest.py \
+  --image-root data/external/vijay_multiclass_weather_kaggle/dataset \
+  --dataset-name external_vijay_multiclass_weather \
+  --dataset-url "https://www.kaggle.com/datasets/vijaygiitk/multiclass-weather-dataset" \
+  --license "Kaggle dataset; verify competition terms before redistribution" \
+  --label-map-preset vijay_mwd \
+  --class-map outputs/convnextv2_384/class_to_idx.json \
+  --skip-reserved-splits \
+  --sample-weight 0.2 \
+  --output-csv data/external/vijay_multiclass_weather_kaggle/external_train.csv \
+  --summary-json data/external/vijay_multiclass_weather_kaggle/summary.json
 
 python3 external_dataset_manifest.py \
   --image-root data/external/weapd_kaggle/dataset \
@@ -510,13 +528,18 @@ python3 external_dataset_manifest.py \
   --doi 10.7910/DVN/M8JQCR \
   --label-map-preset weapd \
   --class-map outputs/convnextv2_384/class_to_idx.json \
+  --sample-weight 0.1 \
   --output-csv data/external/weapd_kaggle/external_train.csv \
   --summary-json data/external/weapd_kaggle/summary.json
 ```
 
-如果官方类别不包含 `dew/lightning/rainbow/sandstorm` 这类标签，`--class-map` 会直接阻止它们进入 manifest；可用自定义 JSON 映射并开启 `--drop-unmapped`，只保留能对齐官方类别的样本。summary 会记录 `dataset_url/license/doi/label_map_sha256`，便于赛前审计数据来源。
+如果官方类别不包含 `dew/lightning/rainbow/sandstorm` 这类标签，`--class-map` 会直接阻止它们进入 manifest；可用自定义 JSON 映射并开启 `--drop-unmapped`，只保留能对齐官方类别的样本。summary 会记录 `dataset_url/license/doi/label_map_sha256/sample_weight`，便于赛前审计数据来源。外部 manifest 会显式写出 `sample_weight`；preflight 看到 `source=external_*` 且缺少该列会失败，避免外部数据被默认等权训练。
 
-外部数据默认不直接等权并入官方训练集。推荐用法是：先按官方类别过滤，再加 `source=external` 和低 `sample_weight`，或只导出 DINOv2/CLIP/timm embedding 给 `embedding_guard.py` 做伪标签语义裁判。若比赛规则禁止外部数据，则这些数据只能用于本地鲁棒性分析，不进入最终训练。
+外部数据默认不直接等权并入官方训练集。推荐路线：官方 5-fold OOF 强基线 -> OOF hard mining -> 只加 Road Weather-Time `sample_weight 0.3/0.5` 做 3-fold A/B -> 再考虑伪标签 + embedding guard。WEAPD 和 Vijay 优先导出 DINOv2/CLIP/timm embedding 给 `embedding_guard.py` 做语义裁判或异常分析；只有当官方某类明显缺样本时，再用低权重、小比例补充。若比赛规则禁止外部数据，则这些数据只能用于本地鲁棒性分析，不进入最终训练。
+
+## 一次性服务器训练路线
+
+不要先堆多架构 ensemble。第一天优先跑 `configs/convnextv2_384.yaml` 官方 5-fold，拿到 OOF、每类 F1 和混淆矩阵；随后用 `hard_mining.py` 生成 `train_hard_weighted.csv`，并用 `classifier_rebalance_grid.py` 做 tau-norm/cRT/LWS 头部重平衡。外部数据只先做 Road Weather-Time `sample_weight=0.3/0.5` 两档 3-fold A/B；只有当 macro F1、最低类 F1 和混淆矩阵同时改善，才扩到 5-fold。`Balanced Softmax`、`LDAM`、`AugMix JSD` 分开做 3-fold 对照，不要混在同一次训练里。最终提交优先同架构 EMA/SWA/Model Soup 单 checkpoint；多 checkpoint logits ensemble 只作为离线对照，除非推理预算允许且 OOF 稳定增益明显。
 
 ## 服务器训练前 preflight
 
@@ -553,6 +576,8 @@ python3 training_preflight.py \
   --external-max-sample-weight 0.5 \
   --min-labeled-images-per-class 2
 ```
+
+外部样本必须在 CSV 中显式提供 `sample_weight`，不要依赖默认 `1.0`。建议第一轮 Road Weather-Time 用 `0.3/0.5` 两档做 A/B，Vijay 用 `0.1-0.2`，WEAPD 用 `0.1` 或只做 embedding guard；同时设置 `--external-max-ratio` 和 `--external-max-sample-weight`，防止外部域样本数量或权重压过官方训练集。
 
 如果训练 CSV 包含 `source=pseudo`，建议把伪标签置信度和数量比例设成硬门槛：
 

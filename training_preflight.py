@@ -110,6 +110,14 @@ def _is_external_source(source: str) -> bool:
     return source == "external" or source.startswith("external_")
 
 
+def _has_reserved_test_split_token(row: ManifestRow) -> bool:
+    tokens: set[str] = set()
+    if row.image_id:
+        tokens.update(part.lower() for part in Path(row.image_id).parts)
+    tokens.update(part.lower() for part in row.path.parts)
+    return bool(tokens & {"test_dataset", "test_images", "alien_test"})
+
+
 def _validate_sources(
     rows: list[ManifestRow],
     allow_external_data: bool,
@@ -122,6 +130,23 @@ def _validate_sources(
     external_rows = sum(count for source, count in source_counts.items() if _is_external_source(source))
     if external_rows and not allow_external_data:
         raise ValueError("external data is present but --allow-external-data was not set")
+    if external_rows:
+        reserved_test_rows = [
+            row.image_id or str(row.path)
+            for row in rows
+            if _is_external_source(row.source) and _has_reserved_test_split_token(row)
+        ]
+        if reserved_test_rows:
+            preview = reserved_test_rows[:5]
+            raise ValueError(f"external rows reference reserved test split paths: {preview}")
+        implicit_weight = [
+            row.image_id or str(row.path)
+            for row in rows
+            if _is_external_source(row.source) and not row.has_explicit_sample_weight
+        ]
+        if implicit_weight:
+            preview = implicit_weight[:5]
+            raise ValueError(f"external rows require explicit sample_weight values: {preview}")
     if external_rows and external_max_ratio is not None:
         if external_max_ratio < 0 or external_max_ratio > 1:
             raise ValueError("external_max_ratio must be in [0, 1]")

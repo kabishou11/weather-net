@@ -21,6 +21,7 @@ class ManifestRow:
     confidence: float = 1.0
     sample_weight: float = 1.0
     teacher_probs: tuple[float, ...] | None = None
+    has_explicit_sample_weight: bool = True
 
 
 def is_image_file(path: Path) -> bool:
@@ -67,6 +68,7 @@ def build_manifest_from_image_folder(
                     source="labeled",
                     confidence=1.0,
                     sample_weight=1.0,
+                    has_explicit_sample_weight=True,
                 )
             )
     if not rows:
@@ -147,10 +149,13 @@ def build_manifest_from_csv(
             raise ValueError(f"confidence must be finite and in [0, 1]: {image_id}")
         if sample_weight_column:
             sample_weight = float(row[sample_weight_column])
+            has_explicit_sample_weight = True
         elif source == "pseudo":
             sample_weight = 0.3 + (0.7 * confidence)
+            has_explicit_sample_weight = False
         else:
             sample_weight = 1.0
+            has_explicit_sample_weight = False
         if not math.isfinite(sample_weight) or sample_weight <= 0:
             raise ValueError(f"sample_weight must be finite and positive: {image_id}")
         teacher_probs: tuple[float, ...] | None = None
@@ -173,6 +178,7 @@ def build_manifest_from_csv(
                 source=source,
                 confidence=confidence,
                 sample_weight=sample_weight,
+                has_explicit_sample_weight=has_explicit_sample_weight,
                 teacher_probs=teacher_probs,
             )
         )
@@ -203,6 +209,7 @@ def build_unlabeled_manifest_from_csv(
             source="unlabeled",
             confidence=1.0,
             sample_weight=1.0,
+            has_explicit_sample_weight=True,
         )
         for row in rows
     ]

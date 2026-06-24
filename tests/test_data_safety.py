@@ -44,6 +44,15 @@ def test_csv_manifest_rejects_non_positive_sample_weight(tmp_path: Path) -> None
         build_manifest_from_csv(csv_path, image_root=tmp_path / "images")
 
 
+def test_manifest_row_preserves_teacher_probs_positional_compatibility(tmp_path: Path) -> None:
+    from src.weather_net.data import ManifestRow
+
+    row = ManifestRow(tmp_path / "rain.jpg", 0, "rain", "rain.jpg", "labeled", 1.0, 1.0, (0.9, 0.1))
+
+    assert row.teacher_probs == (0.9, 0.1)
+    assert row.has_explicit_sample_weight is True
+
+
 def test_unlabeled_csv_manifest_preserves_original_image_id(tmp_path: Path) -> None:
     from src.weather_net.data import build_unlabeled_manifest_from_csv
 

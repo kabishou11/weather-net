@@ -31,6 +31,76 @@ def test_preflight_rejects_external_rows_without_explicit_allowance(tmp_path: Pa
         )
 
 
+def test_preflight_requires_explicit_sample_weight_for_external_rows(tmp_path: Path) -> None:
+    from training_preflight import run_preflight_checks
+
+    _make_image(tmp_path / "images" / "labeled.jpg")
+    _make_image(tmp_path / "images" / "external.jpg")
+    train_csv = tmp_path / "train.csv"
+    train_csv.write_text(
+        "image,label,source\n"
+        "labeled.jpg,rain,labeled\n"
+        "external.jpg,rain,external_road_weather_time\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="explicit sample_weight"):
+        run_preflight_checks(
+            config_path=Path("configs/convnext_tiny.yaml"),
+            train_csv=train_csv,
+            image_root=tmp_path / "images",
+            allow_external_data=True,
+        )
+
+
+def test_preflight_rejects_external_test_split_paths(tmp_path: Path) -> None:
+    from training_preflight import run_preflight_checks
+
+    _make_image(tmp_path / "images" / "train.jpg")
+    _make_image(tmp_path / "images" / "test_dataset" / "test_images" / "leak.jpg")
+    train_csv = tmp_path / "train.csv"
+    train_csv.write_text(
+        "image,label,source,sample_weight\n"
+        "train.jpg,rain,labeled,1.0\n"
+        "test_dataset/test_images/leak.jpg,rain,external_road_weather_time,0.3\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="reserved test split"):
+        run_preflight_checks(
+            config_path=Path("configs/convnext_tiny.yaml"),
+            train_csv=train_csv,
+            image_root=tmp_path / "images",
+            allow_external_data=True,
+            external_max_ratio=0.5,
+            external_max_sample_weight=0.5,
+        )
+
+
+def test_preflight_rejects_external_alien_test_paths(tmp_path: Path) -> None:
+    from training_preflight import run_preflight_checks
+
+    _make_image(tmp_path / "images" / "train.jpg")
+    _make_image(tmp_path / "images" / "alien_test" / "alien.jpg")
+    train_csv = tmp_path / "train.csv"
+    train_csv.write_text(
+        "image,label,source,sample_weight\n"
+        "train.jpg,rain,labeled,1.0\n"
+        "alien_test/alien.jpg,rain,external_vijay_multiclass_weather,0.2\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="reserved test split"):
+        run_preflight_checks(
+            config_path=Path("configs/convnext_tiny.yaml"),
+            train_csv=train_csv,
+            image_root=tmp_path / "images",
+            allow_external_data=True,
+            external_max_ratio=0.5,
+            external_max_sample_weight=0.5,
+        )
+
+
 def test_preflight_requires_teacher_columns_when_distillation_is_enabled(tmp_path: Path) -> None:
     import pytest
 
