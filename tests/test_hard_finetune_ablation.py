@@ -60,6 +60,76 @@ def test_summarize_ablation_results_selects_best_macro_f1(tmp_path: Path) -> Non
     assert summary["results"][1]["per_class_f1_mean"]["fog"] == 0.69
 
 
+def test_summarize_ablation_results_rejects_unstable_tail_class_winner(tmp_path: Path) -> None:
+    from hard_finetune_ablation import summarize_ablation_results
+
+    for usage, macro_f1, fog_f1 in [
+        ("loss", 0.72, 0.66),
+        ("sampler", 0.74, 0.67),
+        ("both", 0.78, 0.40),
+    ]:
+        run_dir = tmp_path / usage
+        run_dir.mkdir(parents=True)
+        (run_dir / "training_summary.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "fold": 0,
+                        "best_macro_f1": macro_f1,
+                        "per_class_f1": {"fog": fog_f1, "sunny": 0.9},
+                    }
+                ],
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+    summary = summarize_ablation_results(
+        output_root=tmp_path,
+        usages=["loss", "sampler", "both"],
+        baseline_usage="loss",
+        min_per_class_f1=0.6,
+        min_delta_macro_f1=0.0,
+    )
+
+    assert summary["best_usage"] == "sampler"
+    rejected = {item["usage"]: item["selection_status"] for item in summary["results"]}
+    assert rejected["both"] == "rejected_min_per_class_f1"
+
+
+def test_summarize_ablation_results_tie_breaks_toward_lower_risk_usage(tmp_path: Path) -> None:
+    from hard_finetune_ablation import summarize_ablation_results
+
+    for usage, macro_f1 in [
+        ("loss", 0.740),
+        ("sampler", 0.741),
+        ("both", 0.741),
+    ]:
+        run_dir = tmp_path / usage
+        run_dir.mkdir(parents=True)
+        (run_dir / "training_summary.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "fold": 0,
+                        "best_macro_f1": macro_f1,
+                        "per_class_f1": {"fog": 0.7, "sunny": 0.8},
+                    }
+                ],
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+    summary = summarize_ablation_results(
+        output_root=tmp_path,
+        usages=["loss", "sampler", "both"],
+        tie_epsilon=0.002,
+    )
+
+    assert summary["best_usage"] == "loss"
+
+
 def test_hard_finetune_ablation_parse_args_accepts_usage_list(monkeypatch) -> None:
     from hard_finetune_ablation import parse_args
 
@@ -75,6 +145,14 @@ def test_hard_finetune_ablation_parse_args_accepts_usage_list(monkeypatch) -> No
             "--usage",
             "loss",
             "sampler",
+            "--baseline-usage",
+            "loss",
+            "--min-per-class-f1",
+            "0.6",
+            "--min-delta-macro-f1",
+            "0.005",
+            "--tie-epsilon",
+            "0.002",
             "--summarize",
         ],
     )
@@ -84,6 +162,10 @@ def test_hard_finetune_ablation_parse_args_accepts_usage_list(monkeypatch) -> No
     assert args.base_config == Path("base.yaml")
     assert args.output_root == Path("outputs/ab")
     assert args.usage == ["loss", "sampler"]
+    assert args.baseline_usage == "loss"
+    assert args.min_per_class_f1 == 0.6
+    assert args.min_delta_macro_f1 == 0.005
+    assert args.tie_epsilon == 0.002
     assert args.summarize is True
 
 

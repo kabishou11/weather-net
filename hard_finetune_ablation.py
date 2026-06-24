@@ -14,6 +14,7 @@ from src.weather_net.training import train_config
 
 
 DEFAULT_USAGES = ["loss", "sampler", "both"]
+USAGE_RISK_ORDER = {"loss": 0, "sampler": 1, "both": 2}
 
 
 @dataclass(frozen=True)
@@ -125,9 +126,21 @@ def _mean(values: Sequence[float]) -> float:
 def summarize_ablation_results(
     output_root: Path,
     usages: Sequence[str] = DEFAULT_USAGES,
+    baseline_usage: str = "loss",
+    min_per_class_f1: float = 0.0,
+    min_delta_macro_f1: float = 0.0,
+    tie_epsilon: float = 0.0,
 ) -> dict[str, object]:
+    if not 0 <= min_per_class_f1 <= 1:
+        raise ValueError("min_per_class_f1 must be in [0, 1]")
+    if tie_epsilon < 0:
+        raise ValueError("tie_epsilon must be non-negative")
     results: list[dict[str, object]] = []
-    for usage in _validate_usages(usages):
+    usage_values = _validate_usages(usages)
+    if baseline_usage not in usage_values:
+        raise ValueError("baseline_usage must be included in usages")
+    baseline_macro_f1: float | None = None
+    for usage in usage_values:
         run_dir = output_root / usage
         folds = _read_training_summary(run_dir)
         if any("best_macro_f1" not in item for item in folds):
@@ -153,10 +166,44 @@ def summarize_ablation_results(
                 },
             }
         )
-    best = max(results, key=lambda item: float(item["macro_f1_mean"]))
+        if usage == baseline_usage:
+            baseline_macro_f1 = float(results[-1]["macro_f1_mean"])
+    if baseline_macro_f1 is None:
+        raise ValueError("baseline result was not found")
+    for item in results:
+        per_class_scores = item["per_class_f1_mean"]
+        min_class_f1 = min(per_class_scores.values()) if per_class_scores else 0.0
+        delta = float(item["macro_f1_mean"]) - baseline_macro_f1
+        item["min_per_class_f1"] = float(min_class_f1)
+        item["delta_macro_f1_vs_baseline"] = float(delta)
+        if min_class_f1 < min_per_class_f1:
+            item["selection_status"] = "rejected_min_per_class_f1"
+        elif item["usage"] != baseline_usage and delta < min_delta_macro_f1:
+            item["selection_status"] = "rejected_min_delta_macro_f1"
+        else:
+            item["selection_status"] = "candidate"
+    candidates = [item for item in results if item["selection_status"] == "candidate"]
+    if not candidates:
+        candidates = [item for item in results if item["usage"] == baseline_usage]
+    top_score = max(float(item["macro_f1_mean"]) for item in candidates)
+    near_top = [item for item in candidates if top_score - float(item["macro_f1_mean"]) <= tie_epsilon]
+    best = min(
+        near_top,
+        key=lambda item: (
+            USAGE_RISK_ORDER.get(str(item["usage"]), 99),
+            -float(item["macro_f1_mean"]),
+        ),
+    )
     return {
         "best_usage": best["usage"],
         "best_macro_f1_mean": best["macro_f1_mean"],
+        "baseline_usage": baseline_usage,
+        "baseline_macro_f1_mean": baseline_macro_f1,
+        "selection": {
+            "min_per_class_f1": min_per_class_f1,
+            "min_delta_macro_f1": min_delta_macro_f1,
+            "tie_epsilon": tie_epsilon,
+        },
         "results": results,
     }
 
@@ -191,6 +238,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--folds", type=int, default=None)
     parser.add_argument("--device", type=str, default="auto")
+    parser.add_argument("--baseline-usage", choices=["loss", "sampler", "both"], default="loss")
+    parser.add_argument("--min-per-class-f1", type=float, default=0.0)
+    parser.add_argument("--min-delta-macro-f1", type=float, default=0.0)
+    parser.add_argument("--tie-epsilon", type=float, default=0.0)
     parser.add_argument("--run", action="store_true")
     parser.add_argument("--summarize", action="store_true")
     return parser.parse_args()
@@ -213,7 +264,14 @@ def main() -> None:
         for item in configs:
             train_config(load_config(item.config_path), device_request=args.device)
     if args.summarize or args.run:
-        summary = summarize_ablation_results(args.output_root, usages=args.usage)
+        summary = summarize_ablation_results(
+            args.output_root,
+            usages=args.usage,
+            baseline_usage=args.baseline_usage,
+            min_per_class_f1=args.min_per_class_f1,
+            min_delta_macro_f1=args.min_delta_macro_f1,
+            tie_epsilon=args.tie_epsilon,
+        )
         json_path, csv_path = write_summary(args.output_root, summary)
         print(json.dumps({**summary, "json": str(json_path), "csv": str(csv_path)}, indent=2, ensure_ascii=False))
     else:
