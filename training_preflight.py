@@ -13,6 +13,7 @@ from PIL import Image
 from inference_budget import check_inference_budget
 from src.weather_net.config import AppConfig, load_config
 from src.weather_net.data import ManifestRow, build_manifest_from_csv, build_manifest_from_image_folder, idx_to_class, load_class_mapping
+from src.weather_net.training import validate_external_merge_audit
 
 
 def _load_rows(
@@ -210,6 +211,7 @@ def _validate_class_support(
     class_to_idx: dict[str, int],
     min_images_per_class: int,
     min_labeled_images_per_class: int | None = None,
+    min_labeled_images_reason: str | None = None,
     expected_classes: list[str] | None = None,
     require_all_expected_classes: bool = False,
 ) -> dict[str, object]:
@@ -240,6 +242,11 @@ def _validate_class_support(
             if labeled_counts.get(name, 0) < min_labeled_images_per_class
         ]
         if missing_labeled:
+            if min_labeled_images_reason is not None:
+                raise ValueError(
+                    f"labeled classes below {min_labeled_images_reason} "
+                    f"(min_labeled_images_per_class={min_labeled_images_per_class}): {missing_labeled}"
+                )
             raise ValueError(
                 "labeled classes below min_labeled_images_per_class="
                 f"{min_labeled_images_per_class}: {missing_labeled}"
@@ -332,6 +339,7 @@ def _validate_inference_budget(
 
 def run_preflight_checks(
     config_path: Path | None,
+    config: AppConfig | None = None,
     profile: str = "custom",
     train_csv: Path | None = None,
     train_dir: Path | None = None,
@@ -359,6 +367,9 @@ def run_preflight_checks(
 ) -> dict[str, Any]:
     if profile not in {"custom", "server-strict"}:
         raise ValueError("profile must be one of: custom, server-strict")
+    if config is None:
+        config = load_config(config_path if config_path is not None else None)
+    min_labeled_images_reason = None
     if profile == "server-strict":
         check_image_exists = True
         check_readable_images = True
@@ -375,10 +386,13 @@ def run_preflight_checks(
             pseudo_max_ratio = 0.5
         if min_labeled_images_per_class is None:
             min_labeled_images_per_class = 2
+        requested_folds = int(config.data.folds)
+        if requested_folds > min_labeled_images_per_class:
+            min_labeled_images_reason = "requested folds"
+        min_labeled_images_per_class = max(min_labeled_images_per_class, requested_folds)
         if inference_stats is not None and max_seconds_per_image is None:
             max_seconds_per_image = 0.05
 
-    config = load_config(config_path if config_path is not None else None)
     rows, class_to_idx = _load_rows(
         config,
         train_csv=train_csv,
@@ -392,6 +406,7 @@ def run_preflight_checks(
         class_to_idx,
         min_images_per_class=min_images_per_class,
         min_labeled_images_per_class=min_labeled_images_per_class,
+        min_labeled_images_reason=min_labeled_images_reason,
         expected_classes=expected_classes,
         require_all_expected_classes=require_all_expected_classes,
     )
@@ -411,6 +426,7 @@ def run_preflight_checks(
         pseudo_min_confidence=pseudo_min_confidence,
         pseudo_max_ratio=pseudo_max_ratio,
     )
+    external_audit = validate_external_merge_audit(rows, config) if profile == "server-strict" else None
     teacher = _validate_teacher_distillation(
         rows,
         config.train.distillation_alpha,
@@ -435,6 +451,7 @@ def run_preflight_checks(
         "label_counts": label_counts["all"],
         "labeled_label_counts": label_counts["labeled"],
         "source_counts": source_counts,
+        "external_audit": external_audit,
         "image_integrity": image_integrity,
         "teacher_distillation": teacher,
         "inference_budget": inference,

@@ -30,6 +30,8 @@ yyy.jpg,sunny
 
 如果官方数据先以 ImageFolder 训练，首轮会在 `--output-dir` 下生成 `class_to_idx.json`。如果官方数据只提供 CSV，先手工准备或用一次官方类表生成 `outputs/official/class_to_idx.json`；后续所有 CSV 训练都必须通过 `--class-map` 使用同一份官方映射。
 
+`train.py` 默认会在开训前执行 `--preflight server-strict`。正式服务器训练不需要额外打开它；命令行覆盖后的 `--train-csv/--class-map/--folds` 等配置会参与同一次预检，避免磁盘配置和实际训练参数漂移。若只是本地冒烟或单元调试，必须显式使用 `--preflight off --i-understand-preflight-off` 才能关闭，避免一次长训练绕过数据门控。
+
 ```bash
 python3 train.py \
   --config configs/convnext_tiny.yaml \
@@ -655,7 +657,7 @@ data:
 
 ## 服务器训练前 preflight
 
-正式上 4090/服务器前先跑训练门控，避免一次长训练被 CSV、类别映射、外部数据、teacher 列或推理预算问题毁掉：
+正式上 4090/服务器前先跑训练门控，避免一次长训练被 CSV、类别映射、外部数据、teacher 列或推理预算问题毁掉。`train.py` 默认使用同一套 `server-strict` 门控；下面命令用于单独预检和保存审计 JSON：
 
 ```bash
 python3 training_preflight.py \
@@ -668,7 +670,7 @@ python3 training_preflight.py \
   --output outputs/preflight_train.json
 ```
 
-`--profile server-strict` 会自动打开图片存在/可读、`image_id`、真实路径、图片内容 hash 去重、伪标签阈值、外部样本权重和真实标注类支撑等关键门控；CSV 训练必须提供 `--class-map` 或配置 `data.class_map`，确保 preflight 与训练入口使用同一份官方类别映射。
+`--profile server-strict` 会自动打开图片存在/可读、`image_id`、真实路径、图片内容 hash 去重、伪标签阈值、外部样本权重和真实标注类支撑等关键门控；真实标注每类数量必须不少于 `data.folds`，防止 K 折训练静默降折。CSV 训练必须提供 `--class-map` 或配置 `data.class_map`，确保 preflight 与训练入口使用同一份官方类别映射。
 
 如果训练 CSV 包含 `source=external` 或 `external_*`，必须显式声明规则允许外部公开数据：
 
@@ -685,6 +687,8 @@ python3 training_preflight.py \
 ```
 
 外部样本必须在 CSV 中显式提供 `sample_weight`，不要依赖默认 `1.0`。建议第一轮 Road Weather-Time 用 `0.3/0.5` 两档做 A/B，Vijay 用 `0.1-0.2`，WEAPD 用 `0.1` 或只做 embedding guard；同时设置 `--external-max-ratio` 和 `--external-max-sample-weight`，防止外部域样本数量或权重压过官方训练集。
+
+在 `server-strict` 下，只要训练 CSV 含 `source=external` 或 `external_*`，还必须在配置里设置 `data.external_audit_json`，指向 `merge_external_training.py` 生成的官方锚定合并审计。`training_preflight.py --profile custom` 仍可单独审计外部 manifest，不强制要求该 merge audit；正式训练入口不使用 custom 作为默认值。
 
 如果训练 CSV 包含 `source=pseudo`，建议把伪标签置信度和数量比例设成硬门槛：
 

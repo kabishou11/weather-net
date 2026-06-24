@@ -80,6 +80,48 @@ def test_train_parse_args_accepts_preflight_gates(monkeypatch) -> None:
     assert args.max_checkpoints == 1
 
 
+def test_train_parse_args_defaults_to_server_strict(monkeypatch) -> None:
+    from train import parse_args
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "train.py",
+            "--train-csv",
+            "data/train.csv",
+            "--image-root",
+            "data/images",
+            "--class-map",
+            "outputs/class_to_idx.json",
+        ],
+    )
+
+    args = parse_args()
+
+    assert args.preflight == "server-strict"
+
+
+def test_train_main_rejects_preflight_off_without_confirmation(monkeypatch, tmp_path: Path) -> None:
+    import train
+
+    config_path = tmp_path / "config.yaml"
+    _write_minimal_config(config_path)
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "train.py",
+            "--config",
+            str(config_path),
+            "--preflight",
+            "off",
+        ],
+    )
+
+    with pytest.raises(ValueError, match="--i-understand-preflight-off"):
+        train.main()
+
+
 def test_train_main_runs_preflight_before_training(monkeypatch, tmp_path: Path) -> None:
     import json
 
@@ -129,7 +171,63 @@ def test_train_main_runs_preflight_before_training(monkeypatch, tmp_path: Path) 
     assert calls[0][0] == "preflight"
     assert calls[0][1]["profile"] == "server-strict"
     assert calls[0][1]["class_map"] == class_map
+    assert calls[0][1]["config"].data.class_map == class_map
+    assert calls[0][1]["config"].train.output_dir == output_dir
     assert calls[1] == ("train", output_dir)
+
+
+def test_train_main_preflight_uses_cli_folds_override(monkeypatch, tmp_path: Path) -> None:
+    import json
+
+    from PIL import Image
+
+    import train
+
+    samples = [
+        ("rain1.jpg", "rain", (10, 20, 30)),
+        ("rain2.jpg", "rain", (11, 20, 30)),
+        ("sunny1.jpg", "sunny", (30, 20, 10)),
+        ("sunny2.jpg", "sunny", (30, 21, 10)),
+    ]
+    image_root = tmp_path / "images"
+    image_root.mkdir()
+    for image_name, _label, color in samples:
+        Image.new("RGB", (8, 8), color).save(image_root / image_name)
+    train_csv = tmp_path / "train.csv"
+    train_csv.write_text(
+        "image,label,source\n" + "".join(f"{image_name},{label},labeled\n" for image_name, label, _color in samples),
+        encoding="utf-8",
+    )
+    class_map = tmp_path / "class_to_idx.json"
+    class_map.write_text(json.dumps({"rain": 0, "sunny": 1}), encoding="utf-8")
+    config_path = tmp_path / "config.yaml"
+    _write_minimal_config(config_path)
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "train.py",
+            "--config",
+            str(config_path),
+            "--train-csv",
+            str(train_csv),
+            "--image-root",
+            str(image_root),
+            "--class-map",
+            str(class_map),
+            "--folds",
+            "3",
+        ],
+    )
+
+    monkeypatch.setattr(
+        train,
+        "train_config",
+        lambda _config, device_request="auto": pytest.fail("train_config should not run after preflight failure"),
+    )
+
+    with pytest.raises(ValueError, match="labeled classes below requested folds"):
+        train.main()
 
 
 def test_train_main_rejects_csv_and_imagefolder_inputs(monkeypatch, tmp_path: Path) -> None:

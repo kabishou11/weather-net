@@ -15,7 +15,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-csv", type=Path, default=None)
     parser.add_argument("--image-root", type=Path, default=None)
     parser.add_argument("--class-map", type=Path, default=None)
-    parser.add_argument("--preflight", choices=["off", "custom", "server-strict"], default="off")
+    parser.add_argument("--preflight", choices=["off", "custom", "server-strict"], default="server-strict")
+    parser.add_argument("--i-understand-preflight-off", action="store_true")
     parser.add_argument("--allow-external-data", action="store_true")
     parser.add_argument("--external-max-ratio", type=float, default=None)
     parser.add_argument("--external-max-sample-weight", type=float, default=None)
@@ -64,10 +65,13 @@ def main() -> None:
     validate_config(config)
     if config.data.train_csv is not None and config.data.train_dir is not None:
         raise ValueError("train.py requires either --train-csv or --train-dir, not both")
+    if args.preflight == "off" and not args.i_understand_preflight_off:
+        raise ValueError("--preflight off requires --i-understand-preflight-off")
 
     if args.preflight != "off":
         run_preflight_checks(
             config_path=args.config,
+            config=config,
             profile=args.preflight,
             train_csv=config.data.train_csv,
             train_dir=config.data.train_dir,

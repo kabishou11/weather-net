@@ -53,6 +53,63 @@ def test_preflight_requires_explicit_sample_weight_for_external_rows(tmp_path: P
         )
 
 
+def test_server_strict_requires_external_merge_audit(tmp_path: Path) -> None:
+    import json
+
+    from training_preflight import run_preflight_checks
+
+    _make_image(tmp_path / "images" / "labeled1.jpg", color=(1, 2, 3))
+    _make_image(tmp_path / "images" / "labeled2.jpg", color=(2, 3, 4))
+    _make_image(tmp_path / "images" / "external.jpg", color=(3, 4, 5))
+    train_csv = tmp_path / "train.csv"
+    train_csv.write_text(
+        "image,label,source,sample_weight\n"
+        "labeled1.jpg,rain,labeled,1.0\n"
+        "labeled2.jpg,rain,labeled,1.0\n"
+        "external.jpg,rain,external_road_weather_time,0.3\n",
+        encoding="utf-8",
+    )
+    class_map = tmp_path / "class_to_idx.json"
+    class_map.write_text(json.dumps({"rain": 0}), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="external merge audit"):
+        run_preflight_checks(
+            config_path=Path("configs/convnext_tiny.yaml"),
+            profile="server-strict",
+            train_csv=train_csv,
+            image_root=tmp_path / "images",
+            class_map=class_map,
+            allow_external_data=True,
+        )
+
+
+def test_custom_preflight_allows_external_manifest_audit_without_merge_audit(tmp_path: Path) -> None:
+    from training_preflight import run_preflight_checks
+
+    _make_image(tmp_path / "images" / "labeled.jpg", color=(1, 2, 3))
+    _make_image(tmp_path / "images" / "external.jpg", color=(3, 4, 5))
+    train_csv = tmp_path / "train.csv"
+    train_csv.write_text(
+        "image,label,source,sample_weight\n"
+        "labeled.jpg,rain,labeled,1.0\n"
+        "external.jpg,rain,external_road_weather_time,0.3\n",
+        encoding="utf-8",
+    )
+
+    result = run_preflight_checks(
+        config_path=Path("configs/convnext_tiny.yaml"),
+        profile="custom",
+        train_csv=train_csv,
+        image_root=tmp_path / "images",
+        allow_external_data=True,
+        external_max_ratio=0.5,
+        external_max_sample_weight=0.5,
+    )
+
+    assert result["external_audit"] is None
+    assert result["source_counts"] == {"external_road_weather_time": 1, "labeled": 1}
+
+
 def test_preflight_rejects_external_test_split_paths(tmp_path: Path) -> None:
     from training_preflight import run_preflight_checks
 
@@ -273,6 +330,39 @@ def test_server_strict_profile_enables_high_value_gates(tmp_path: Path) -> None:
         "checked_unique_image_hash": True,
     }
     assert result["labeled_label_counts"] == {"rain": 2, "sunny": 2}
+
+
+def test_server_strict_rejects_labeled_support_below_requested_folds(tmp_path: Path) -> None:
+    import json
+
+    from training_preflight import run_preflight_checks
+
+    samples = [
+        ("rain1.jpg", "rain", (10, 20, 30)),
+        ("rain2.jpg", "rain", (11, 20, 30)),
+        ("sunny1.jpg", "sunny", (30, 20, 10)),
+        ("sunny2.jpg", "sunny", (30, 21, 10)),
+    ]
+    for image_name, _label, color in samples:
+        _make_image(tmp_path / "images" / image_name, color=color)
+    train_csv = tmp_path / "train.csv"
+    train_csv.write_text(
+        "image,label,source\n" + "".join(f"{image_name},{label},labeled\n" for image_name, label, _color in samples),
+        encoding="utf-8",
+    )
+    class_map = tmp_path / "class_to_idx.json"
+    class_map.write_text(json.dumps({"rain": 0, "sunny": 1}), encoding="utf-8")
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("data:\n  folds: 3\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="labeled classes below requested folds"):
+        run_preflight_checks(
+            config_path=config_path,
+            profile="server-strict",
+            train_csv=train_csv,
+            image_root=tmp_path / "images",
+            class_map=class_map,
+        )
 
 
 def test_preflight_rejects_labels_outside_expected_classes(tmp_path: Path) -> None:
