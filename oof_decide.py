@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from collections import Counter
 from pathlib import Path
 from typing import Sequence
 
@@ -28,7 +29,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _load_oof_npz(path: Path) -> tuple[np.ndarray, np.ndarray, list[str], list[str]]:
+def _load_oof_npz(path: Path) -> tuple[np.ndarray, np.ndarray, list[str], list[str], list[str]]:
     data = np.load(path, allow_pickle=True)
     required = {"logits", "y_true", "class_names"}
     missing = required - set(data.files)
@@ -40,16 +41,46 @@ def _load_oof_npz(path: Path) -> tuple[np.ndarray, np.ndarray, list[str], list[s
     if "image_id" not in data.files:
         raise ValueError(f"OOF file missing image_id for alignment: {path}")
     image_ids = [str(value) for value in data["image_id"].tolist()]
-    return logits, y_true, class_names, image_ids
+    if logits.ndim != 2:
+        raise ValueError(f"OOF logits must be a 2D array: {path}")
+    if y_true.ndim != 1:
+        raise ValueError(f"OOF y_true must be a 1D array: {path}")
+    if logits.shape[0] != y_true.shape[0] or logits.shape[0] != len(image_ids):
+        raise ValueError(f"OOF logits, y_true, and image_id must have the same number of rows: {path}")
+    if logits.shape[1] != len(class_names):
+        raise ValueError(f"OOF logits class dimension must match class_names: {path}")
+    if not class_names or len(set(class_names)) != len(class_names):
+        raise ValueError(f"OOF class_names must be non-empty and unique: {path}")
+    if y_true.size and (int(y_true.min()) < 0 or int(y_true.max()) >= len(class_names)):
+        raise ValueError(f"OOF y_true contains class ids outside class_names: {path}")
+    duplicates = sorted(image_id for image_id, count in Counter(image_ids).items() if count > 1)
+    if duplicates:
+        preview = ", ".join(duplicates[:5])
+        raise ValueError(f"Duplicate OOF image ids are not safe: {preview}")
+    checkpoint_values = [str(value) for value in data["checkpoint"].tolist()] if "checkpoint" in data.files else []
+    if checkpoint_values and len(checkpoint_values) != logits.shape[0]:
+        raise ValueError(f"OOF checkpoint values must match logits rows: {path}")
+    return logits, y_true, class_names, image_ids, checkpoint_values
 
 
-def _load_aligned_oofs(paths: Sequence[Path]) -> tuple[np.ndarray, np.ndarray, list[str]]:
+def _unique_in_order(values: Sequence[str]) -> list[str]:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for value in values:
+        if value not in seen:
+            seen.add(value)
+            ordered.append(value)
+    return ordered
+
+
+def _load_aligned_oofs(paths: Sequence[Path]) -> tuple[np.ndarray, np.ndarray, list[str], list[list[str]]]:
     logits_list: list[np.ndarray] = []
+    checkpoint_groups: list[list[str]] = []
     expected_y_true: np.ndarray | None = None
     expected_class_names: list[str] | None = None
     expected_image_ids: list[str] | None = None
     for path in paths:
-        logits, y_true, class_names, image_ids = _load_oof_npz(path)
+        logits, y_true, class_names, image_ids, checkpoint_values = _load_oof_npz(path)
         if expected_y_true is None:
             expected_y_true = y_true
             expected_class_names = class_names
@@ -62,16 +93,77 @@ def _load_aligned_oofs(paths: Sequence[Path]) -> tuple[np.ndarray, np.ndarray, l
             if expected_image_ids and image_ids and image_ids != expected_image_ids:
                 raise ValueError(f"OOF image_id order differs: {path}")
         logits_list.append(logits)
+        checkpoint_groups.append(_unique_in_order(checkpoint_values))
     assert expected_y_true is not None
     assert expected_class_names is not None
-    return np.stack(logits_list, axis=0), expected_y_true, expected_class_names
+    return np.stack(logits_list, axis=0), expected_y_true, expected_class_names, checkpoint_groups
+
+
+def _resolve_decision_checkpoints_and_weights(
+    oof_paths: Sequence[Path],
+    checkpoint_groups: Sequence[Sequence[str]],
+    checkpoints: Sequence[Path] | None,
+    oof_weights: Sequence[float],
+) -> tuple[list[str], list[float]]:
+    grouped_checkpoint_names = [list(group) for group in checkpoint_groups]
+    has_checkpoint_metadata = all(grouped_checkpoint_names)
+    if any(grouped_checkpoint_names) and not has_checkpoint_metadata:
+        raise ValueError("OOF checkpoint metadata must be present in all OOF files or none of them")
+    if checkpoints is None:
+        if has_checkpoint_metadata:
+            checkpoint_names = _unique_in_order(
+                checkpoint
+                for group in grouped_checkpoint_names
+                for checkpoint in group
+            )
+            checkpoints_by_name = set(checkpoint_names)
+            expanded_weights = [0.0 for _ in checkpoint_names]
+            for group_idx, group in enumerate(grouped_checkpoint_names):
+                group_indices = [idx for idx, checkpoint in enumerate(checkpoint_names) if checkpoint in set(group)]
+                if len(group_indices) != len(set(group)):
+                    raise ValueError("OOF checkpoint groups must map to unique checkpoint names")
+                per_checkpoint_weight = float(oof_weights[group_idx]) / len(group_indices)
+                for checkpoint_idx in group_indices:
+                    expanded_weights[checkpoint_idx] += per_checkpoint_weight
+            if not checkpoints_by_name:
+                raise ValueError("OOF checkpoint metadata is empty")
+            return checkpoint_names, expanded_weights
+        return [str(path) for path in oof_paths], list(oof_weights)
+
+    checkpoint_names = [str(path) for path in checkpoints]
+    if not has_checkpoint_metadata:
+        if len(checkpoints) != len(oof_paths):
+            raise ValueError("checkpoint count must match OOF count unless OOF files contain checkpoint metadata")
+        return checkpoint_names, list(oof_weights)
+
+    expanded_weights = [0.0 for _ in checkpoint_names]
+    represented = [False for _ in checkpoint_names]
+    for group_idx, group in enumerate(grouped_checkpoint_names):
+        group_set = set(group)
+        group_indices = [idx for idx, checkpoint in enumerate(checkpoint_names) if checkpoint in group_set]
+        missing = sorted(set(group) - set(checkpoint_names))
+        if missing:
+            preview = ", ".join(missing[:5])
+            raise ValueError(f"OOF checkpoint values are missing from --checkpoint: {preview}")
+        if not group_indices:
+            raise ValueError("OOF checkpoint group has no matching --checkpoint entries")
+        per_checkpoint_weight = float(oof_weights[group_idx]) / len(group_indices)
+        for checkpoint_idx in group_indices:
+            expanded_weights[checkpoint_idx] += per_checkpoint_weight
+            represented[checkpoint_idx] = True
+
+    if not all(represented):
+        raise ValueError("Each --checkpoint must be represented by at least one OOF checkpoint group")
+    return checkpoint_names, expanded_weights
 
 
 def _write_report(
     path: Path,
     oof_paths: Sequence[Path],
     class_names: Sequence[str],
-    weights: Sequence[float],
+    oof_weights: Sequence[float],
+    decision_checkpoints: Sequence[str],
+    decision_weights: Sequence[float],
     temperature: float,
     bias: Sequence[float],
     scores: dict[str, float],
@@ -84,7 +176,12 @@ def _write_report(
         "",
         "## Decision",
         f"- Classes: {', '.join(class_names)}",
-        f"- Weights: {', '.join(f'{weight:.6f}' for weight in weights)}",
+        f"- OOF weights: {', '.join(f'{weight:.6f}' for weight in oof_weights)}",
+        "- Inference checkpoints:",
+        *[
+            f"  - `{checkpoint}`: {weight:.6f}"
+            for checkpoint, weight in zip(decision_checkpoints, decision_weights)
+        ],
         f"- Temperature: {temperature:.6f}",
         f"- Bias: {', '.join(f'{value:.6f}' for value in bias)}",
         "",
@@ -102,9 +199,7 @@ def run_oof_decision(
     max_ensemble_steps: int = 12,
     checkpoints: Sequence[Path] | None = None,
 ) -> dict[str, object]:
-    if checkpoints is not None and len(checkpoints) != len(oof_paths):
-        raise ValueError("checkpoint count must match OOF count")
-    logits_by_model, y_true, class_names = _load_aligned_oofs(oof_paths)
+    logits_by_model, y_true, class_names, checkpoint_groups = _load_aligned_oofs(oof_paths)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     baseline_scores = [
@@ -142,20 +237,28 @@ def run_oof_decision(
         "temperature_macro_f1": float(temperature_score),
         "tuned_macro_f1": float(tuned_score),
     }
+    decision_checkpoints, decision_weights = _resolve_decision_checkpoints_and_weights(
+        oof_paths=oof_paths,
+        checkpoint_groups=checkpoint_groups,
+        checkpoints=checkpoints,
+        oof_weights=ensemble_result.weights,
+    )
     write_decision_params(
         output_dir / "decision_params.json",
         class_names=class_names,
         temperature=temperature,
         bias=bias_result.bias,
-        weights=ensemble_result.weights,
+        weights=decision_weights,
         scores=scores,
-        checkpoints=[str(path) for path in (checkpoints or oof_paths)],
+        checkpoints=decision_checkpoints,
     )
     _write_report(
         output_dir / "decision_report.md",
         oof_paths=oof_paths,
         class_names=class_names,
-        weights=ensemble_result.weights,
+        oof_weights=ensemble_result.weights,
+        decision_checkpoints=decision_checkpoints,
+        decision_weights=decision_weights,
         temperature=temperature,
         bias=bias_result.bias,
         scores=scores,
@@ -166,6 +269,9 @@ def run_oof_decision(
                 "oof": [str(path) for path in oof_paths],
                 "num_models": len(oof_paths),
                 "class_names": class_names,
+                "oof_weights": ensemble_result.weights,
+                "decision_checkpoints": decision_checkpoints,
+                "decision_weights": decision_weights,
                 "scores": scores,
             },
             indent=2,
@@ -177,7 +283,8 @@ def run_oof_decision(
     return {
         "num_models": len(oof_paths),
         "class_names": class_names,
-        "weights": ensemble_result.weights,
+        "weights": decision_weights,
+        "oof_weights": ensemble_result.weights,
         "temperature": temperature,
         "bias": bias_result.bias,
         "scores": scores,

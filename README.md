@@ -72,7 +72,7 @@ python3 infer.py \
 
 ```bash
 python3 infer.py \
-  --checkpoint outputs/convnext_tiny/convnext_tiny_fold0.pt \
+  --checkpoint outputs/convnext_tiny/convnext_tiny_fold0.pt outputs/convnext_tiny/convnext_tiny_fold1.pt outputs/convnext_tiny/convnext_tiny_fold2.pt \
   --test-dir data/test \
   --decision-params outputs/decision/exp001/decision_params.json \
   --sample-submission data/sample_submission.csv \
@@ -96,7 +96,7 @@ oof_metrics.json
 ```bash
 python3 oof_decide.py \
   --oof outputs/convnext_tiny/oof/oof_probabilities.npz \
-  --checkpoint outputs/convnext_tiny/convnext_tiny_fold0.pt \
+  --checkpoint outputs/convnext_tiny/convnext_tiny_fold0.pt outputs/convnext_tiny/convnext_tiny_fold1.pt outputs/convnext_tiny/convnext_tiny_fold2.pt \
   --output-dir outputs/decision/exp001
 ```
 
@@ -105,11 +105,11 @@ python3 oof_decide.py \
 ```bash
 python3 oof_decide.py \
   --oof outputs/convnext_tiny/oof/oof_probabilities.npz outputs/fast_effnet/oof/oof_probabilities.npz \
-  --checkpoint outputs/convnext_tiny/convnext_tiny_fold0.pt outputs/fast_effnet/efficientnet_b0_fold0.pt \
+  --checkpoint outputs/convnext_tiny/convnext_tiny_fold0.pt outputs/convnext_tiny/convnext_tiny_fold1.pt outputs/convnext_tiny/convnext_tiny_fold2.pt outputs/fast_effnet/efficientnet_b0_fold0.pt outputs/fast_effnet/efficientnet_b0_fold1.pt outputs/fast_effnet/efficientnet_b0_fold2.pt \
   --output-dir outputs/decision/exp002
 ```
 
-输出的 `decision_params.json` 是提交前的冻结决策产物，避免只凭单次验证分数手填权重。
+输出的 `decision_params.json` 是提交前的冻结决策产物，避免只凭单次验证分数手填权重。若 `oof_probabilities.npz` 来自 K 折训练，文件内会记录每条 OOF 预测对应的 fold checkpoint；`oof_decide.py` 会把 OOF 组权重自动展开为每个 fold checkpoint 的推理权重。线上推理时请传入同一组 fold checkpoint，顺序需与 `decision_params.json` 绑定一致。
 
 ## 伪标签
 

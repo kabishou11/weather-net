@@ -43,9 +43,21 @@ def _sanitize_class_name(name: str) -> str:
     return safe or "class"
 
 
+def _class_column_name(class_idx: int, class_name: str) -> str:
+    return f"{class_idx}_{_sanitize_class_name(class_name)}"
+
+
+def _validate_class_mapping(class_names: Sequence[str], class_to_idx: dict[str, int]) -> None:
+    expected = [name for name, _ in sorted(class_to_idx.items(), key=lambda item: item[1])]
+    if expected != list(class_names):
+        raise ValueError("class_to_idx order must match class_names")
+
+
 def _validate_records(records: Sequence[OofRecord], class_names: Sequence[str]) -> None:
     if not records:
         raise ValueError("OOF records cannot be empty")
+    if len(set(class_names)) != len(class_names):
+        raise ValueError("class_names must be unique")
     counts = Counter(record.image_id for record in records)
     duplicates = sorted(image_id for image_id, count in counts.items() if count > 1)
     if duplicates:
@@ -57,6 +69,10 @@ def _validate_records(records: Sequence[OofRecord], class_names: Sequence[str]) 
             raise ValueError(f"Pseudo rows must not be written as OOF validation records: {record.image_id}")
         if len(record.logits) != expected_classes:
             raise ValueError("Each OOF record must have one logit per class")
+        if record.true_idx < 0 or record.true_idx >= expected_classes:
+            raise ValueError("OOF true_idx must be within the class range")
+        if record.true_label != class_names[record.true_idx]:
+            raise ValueError("OOF true_label must match class_names[true_idx]")
 
 
 def write_oof_artifacts(
@@ -67,6 +83,7 @@ def write_oof_artifacts(
     metadata: dict[str, object],
 ) -> OofArtifactPaths:
     _validate_records(records, class_names)
+    _validate_class_mapping(class_names, class_to_idx)
     output_dir.mkdir(parents=True, exist_ok=True)
     csv_path = output_dir / "oof_predictions.csv"
     npz_path = output_dir / "oof_probabilities.npz"
@@ -84,7 +101,7 @@ def write_oof_artifacts(
     true_probs = probs[np.arange(len(records)), y_true]
     losses = -np.log(np.clip(true_probs, 1e-12, 1.0))
 
-    class_columns = [_sanitize_class_name(name) for name in class_names]
+    class_columns = [_class_column_name(idx, name) for idx, name in enumerate(class_names)]
     fieldnames = [
         "image_id",
         "image_path",
@@ -141,6 +158,8 @@ def write_oof_artifacts(
         image_id=np.asarray([record.image_id for record in records], dtype=object),
         image_path=np.asarray([record.image_path for record in records], dtype=object),
         source=np.asarray([record.source for record in records], dtype=object),
+        checkpoint=np.asarray([record.checkpoint for record in records], dtype=object),
+        model_name=np.asarray([record.model_name for record in records], dtype=object),
         class_names=np.asarray(list(class_names), dtype=object),
     )
 
