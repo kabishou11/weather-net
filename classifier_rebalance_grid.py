@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Sequence
 
 from classifier_rebalance import rebalance_checkpoint, retrain_classifier_head
+from validate import validate_checkpoint
 
 
 @dataclass
@@ -207,6 +208,63 @@ def run_rebalance_grid(
     return candidates
 
 
+def _write_metrics(path: Path, metrics: dict[str, object]) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(metrics, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    return path
+
+
+def validate_rebalance_grid(
+    checkpoint: Path,
+    candidates: Sequence[RebalanceCandidate],
+    output_dir: Path,
+    val_dir: Path | None = None,
+    val_csv: Path | None = None,
+    val_image_root: Path | None = None,
+    batch_size: int = 64,
+    device: str = "auto",
+) -> RebalanceCandidate:
+    if val_dir is None and val_csv is None:
+        raise ValueError("Set val_dir or val_csv when validating rebalance grid")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    baseline = RebalanceCandidate(
+        name="baseline",
+        method="baseline",
+        checkpoint=checkpoint,
+        output=checkpoint,
+        metrics_json=output_dir / "baseline_metrics.json",
+    )
+    baseline_metrics = validate_checkpoint(
+        checkpoint=checkpoint,
+        val_dir=val_dir,
+        val_csv=val_csv,
+        image_root=val_image_root,
+        batch_size=batch_size,
+        device=device,
+    )
+    _write_metrics(baseline.metrics_json, baseline_metrics)
+    for candidate in candidates:
+        candidate.metrics_json = output_dir / f"{candidate.name}_metrics.json"
+        metrics = validate_checkpoint(
+            checkpoint=candidate.output,
+            val_dir=val_dir,
+            val_csv=val_csv,
+            image_root=val_image_root,
+            batch_size=batch_size,
+            device=device,
+        )
+        _write_metrics(candidate.metrics_json, metrics)
+    return baseline
+
+
+def validate_cli_args(args: argparse.Namespace) -> None:
+    if args.validate:
+        if args.baseline_metrics is not None or args.candidate_metrics:
+            raise ValueError("Do not combine --validate with --baseline-metrics or --candidate-metrics")
+        if args.val_dir is None and args.val_csv is None:
+            raise ValueError("--validate requires --val-dir or --val-csv")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build and summarize tau/crt classifier rebalance grids.")
     parser.add_argument("--checkpoint", type=Path, required=True)
@@ -221,6 +279,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--device", type=str, default="auto")
+    parser.add_argument("--validate", action="store_true")
+    parser.add_argument("--val-dir", type=Path, default=None)
+    parser.add_argument("--val-csv", type=Path, default=None)
+    parser.add_argument("--val-image-root", type=Path, default=None)
+    parser.add_argument("--val-batch-size", type=int, default=64)
     parser.add_argument("--baseline-metrics", type=Path, default=None)
     parser.add_argument("--candidate-metrics", type=Path, nargs="*", default=None)
     parser.add_argument("--min-delta-macro-f1", type=float, default=0.0)
@@ -231,6 +294,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    validate_cli_args(args)
     candidates = run_rebalance_grid(
         checkpoint=args.checkpoint,
         output_dir=args.output_dir,
@@ -248,13 +312,26 @@ def main() -> None:
     payload: dict[str, object] = {
         "candidates": [candidate.__dict__ | {"checkpoint": str(candidate.checkpoint), "output": str(candidate.output)} for candidate in candidates]
     }
-    if args.baseline_metrics is not None or args.candidate_metrics:
+    baseline_metrics = args.baseline_metrics
+    if args.validate:
+        baseline = validate_rebalance_grid(
+            checkpoint=args.checkpoint,
+            candidates=candidates,
+            output_dir=args.output_dir,
+            val_dir=args.val_dir,
+            val_csv=args.val_csv,
+            val_image_root=args.val_image_root,
+            batch_size=args.val_batch_size,
+            device=args.device,
+        )
+        baseline_metrics = baseline.metrics_json
+    if baseline_metrics is not None or args.candidate_metrics or args.validate:
         baseline = RebalanceCandidate(
             name="baseline",
             method="baseline",
             checkpoint=args.checkpoint,
             output=args.checkpoint,
-            metrics_json=args.baseline_metrics,
+            metrics_json=baseline_metrics,
         )
         if baseline.metrics_json is None:
             raise ValueError("--baseline-metrics is required when summarizing candidate metrics")

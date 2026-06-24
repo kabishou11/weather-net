@@ -33,30 +33,38 @@ def parse_args() -> argparse.Namespace:
 
 
 @torch.no_grad()
-def main() -> None:
-    args = parse_args()
-    device = resolve_device(args.device)
-    model, class_to_idx, image_size = load_checkpoint(args.checkpoint, device=device)
+def validate_checkpoint(
+    checkpoint: Path,
+    val_dir: Path | None = None,
+    val_csv: Path | None = None,
+    image_root: Path | None = None,
+    batch_size: int = 64,
+    device: str = "auto",
+    errors_csv: Path | None = None,
+    low_confidence_threshold: float = 0.6,
+) -> dict[str, object]:
+    resolved_device = resolve_device(device)
+    model, class_to_idx, image_size = load_checkpoint(checkpoint, device=resolved_device)
 
-    if args.val_dir is not None:
-        rows, _ = build_manifest_from_image_folder(args.val_dir, class_to_idx=class_to_idx)
-    elif args.val_csv is not None:
+    if val_dir is not None:
+        rows, _ = build_manifest_from_image_folder(val_dir, class_to_idx=class_to_idx)
+    elif val_csv is not None:
         rows, _ = build_manifest_from_csv(
-            args.val_csv,
-            image_root=args.image_root,
+            val_csv,
+            image_root=image_root,
             class_to_idx=class_to_idx,
         )
     else:
-        raise SystemExit("Set --val-dir or --val-csv")
+        raise ValueError("Set val_dir or val_csv")
 
     dataset = WeatherImageDataset(rows, transform=build_transforms(image_size, train=False), return_path=True)
-    loader = torch.utils.data.DataLoader(dataset, batch_size=args.batch_size, shuffle=False)
+    loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=False)
     y_true: list[int] = []
     y_pred: list[int] = []
     probabilities: list[list[float]] = []
     image_paths: list[Path] = []
     for images, targets, paths, _ in loader:
-        logits = model(images.to(device))
+        logits = model(images.to(resolved_device))
         probs = torch.softmax(logits, dim=1).cpu()
         y_true.extend(targets.tolist())
         y_pred.extend(logits.argmax(dim=1).cpu().tolist())
@@ -72,12 +80,7 @@ def main() -> None:
         "confusion_matrix": report.confusion_matrix,
         "top_confusions": confusion_pairs(y_true, y_pred, class_names, top_k=20),
     }
-    text = json.dumps(payload, indent=2, ensure_ascii=False)
-    print(text)
-    if args.output_json is not None:
-        args.output_json.parent.mkdir(parents=True, exist_ok=True)
-        args.output_json.write_text(text + "\n", encoding="utf-8")
-    if args.errors_csv is not None:
+    if errors_csv is not None:
         records = build_prediction_records(
             image_paths=image_paths,
             y_true=y_true,
@@ -85,10 +88,33 @@ def main() -> None:
             class_names=class_names,
         )
         write_error_analysis_csv(
-            args.errors_csv,
+            errors_csv,
             records,
+            low_confidence_threshold=low_confidence_threshold,
+        )
+    return payload
+
+
+def main() -> None:
+    args = parse_args()
+    try:
+        payload = validate_checkpoint(
+            checkpoint=args.checkpoint,
+            val_dir=args.val_dir,
+            val_csv=args.val_csv,
+            image_root=args.image_root,
+            batch_size=args.batch_size,
+            device=args.device,
+            errors_csv=args.errors_csv,
             low_confidence_threshold=args.low_confidence_threshold,
         )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    text = json.dumps(payload, indent=2, ensure_ascii=False)
+    print(text)
+    if args.output_json is not None:
+        args.output_json.parent.mkdir(parents=True, exist_ok=True)
+        args.output_json.write_text(text + "\n", encoding="utf-8")
 
 
 if __name__ == "__main__":

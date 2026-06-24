@@ -290,6 +290,28 @@ python3 classifier_rebalance_grid.py \
   --tie-epsilon 0.001
 ```
 
+如果验证集已经准备好，也可以让 grid runner 自动验证 baseline 和所有候选，并直接输出 summary：
+
+```bash
+python3 classifier_rebalance_grid.py \
+  --checkpoint outputs/convnextv2_384/convnextv2_tiny.fcmae_ft_in22k_in1k_fold0.pt \
+  --output-dir outputs/convnextv2_384/rebalance_grid/fold0 \
+  --tau 0.25 0.5 0.75 1.0 \
+  --crt-sampler-mode sqrt class_balanced \
+  --train-csv data/train.csv \
+  --image-root data/images \
+  --run \
+  --validate \
+  --val-csv data/val.csv \
+  --val-image-root data/images \
+  --val-batch-size 64 \
+  --min-delta-macro-f1 0.003 \
+  --min-per-class-f1 0.6 \
+  --tie-epsilon 0.001
+```
+
+`--validate` 会写出 `baseline_metrics.json` 和每个候选的 `{candidate}_metrics.json`，再调用同一套门控汇总逻辑。它不能和 `--baseline-metrics/--candidate-metrics` 混用，避免自动验证结果被手工 metrics 路径误覆盖。
+
 汇总会输出 `classifier_rebalance_grid_summary.json/csv`，只有 macro F1 达到增益门槛且最低类 F1 不崩的候选才会被选中。这个门控用于避免在小验证集上被单一高分候选骗过去。
 
 ## 伪标签

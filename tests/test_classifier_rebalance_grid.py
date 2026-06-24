@@ -105,6 +105,50 @@ def test_run_rebalance_grid_dispatches_tau_and_crt(monkeypatch, tmp_path: Path) 
     ]
 
 
+def test_validate_rebalance_grid_writes_baseline_and_candidate_metrics(monkeypatch, tmp_path: Path) -> None:
+    import classifier_rebalance_grid
+    from classifier_rebalance_grid import build_rebalance_grid, validate_rebalance_grid
+
+    calls: list[Path] = []
+
+    def fake_validate_checkpoint(**kwargs):
+        checkpoint = Path(kwargs["checkpoint"])
+        calls.append(checkpoint)
+        macro_f1 = 0.7
+        if "tau" in checkpoint.stem:
+            macro_f1 = 0.73
+        if "crt" in checkpoint.stem:
+            macro_f1 = 0.72
+        return {"macro_f1": macro_f1, "per_class_f1": {"rain": 0.7, "sunny": 0.8}}
+
+    monkeypatch.setattr(classifier_rebalance_grid, "validate_checkpoint", fake_validate_checkpoint)
+    candidates = build_rebalance_grid(
+        checkpoint=Path("fold0.pt"),
+        output_dir=tmp_path,
+        tau_values=[0.5],
+        crt_sampler_modes=["sqrt"],
+    )
+
+    baseline = validate_rebalance_grid(
+        checkpoint=Path("fold0.pt"),
+        candidates=candidates,
+        output_dir=tmp_path,
+        val_csv=Path("val.csv"),
+        val_image_root=Path("images"),
+        batch_size=16,
+        device="cpu",
+    )
+
+    assert baseline.metrics_json == tmp_path / "baseline_metrics.json"
+    assert [candidate.metrics_json for candidate in candidates] == [
+        tmp_path / "tau0p50_metrics.json",
+        tmp_path / "crt_sqrt_metrics.json",
+    ]
+    assert json.loads((tmp_path / "baseline_metrics.json").read_text(encoding="utf-8"))["macro_f1"] == 0.7
+    assert json.loads((tmp_path / "tau0p50_metrics.json").read_text(encoding="utf-8"))["macro_f1"] == 0.73
+    assert calls == [Path("fold0.pt"), tmp_path / "fold0_tau0p50.pt", tmp_path / "fold0_crt_sqrt.pt"]
+
+
 def test_parse_args_accepts_rebalance_grid_controls(monkeypatch, tmp_path: Path) -> None:
     import sys
 
@@ -125,6 +169,13 @@ def test_parse_args_accepts_rebalance_grid_controls(monkeypatch, tmp_path: Path)
             "--crt-sampler-mode",
             "sqrt",
             "class_balanced",
+            "--validate",
+            "--val-csv",
+            "val.csv",
+            "--val-image-root",
+            "images",
+            "--val-batch-size",
+            "16",
             "--min-delta-macro-f1",
             "0.003",
             "--min-per-class-f1",
@@ -138,5 +189,47 @@ def test_parse_args_accepts_rebalance_grid_controls(monkeypatch, tmp_path: Path)
     assert args.output_dir == tmp_path
     assert args.tau == [0.5, 1.0]
     assert args.crt_sampler_mode == ["sqrt", "class_balanced"]
+    assert args.validate is True
+    assert args.val_csv == Path("val.csv")
+    assert args.val_image_root == Path("images")
+    assert args.val_batch_size == 16
     assert args.min_delta_macro_f1 == 0.003
     assert args.min_per_class_f1 == 0.6
+
+
+def test_validate_cli_args_rejects_mixed_manual_and_auto_metrics() -> None:
+    import argparse
+
+    import pytest
+
+    from classifier_rebalance_grid import validate_cli_args
+
+    args = argparse.Namespace(
+        validate=True,
+        val_dir=None,
+        val_csv=Path("val.csv"),
+        baseline_metrics=Path("baseline.json"),
+        candidate_metrics=None,
+    )
+
+    with pytest.raises(ValueError, match="Do not combine"):
+        validate_cli_args(args)
+
+
+def test_validate_cli_args_requires_validation_manifest() -> None:
+    import argparse
+
+    import pytest
+
+    from classifier_rebalance_grid import validate_cli_args
+
+    args = argparse.Namespace(
+        validate=True,
+        val_dir=None,
+        val_csv=None,
+        baseline_metrics=None,
+        candidate_metrics=None,
+    )
+
+    with pytest.raises(ValueError, match="requires --val-dir or --val-csv"):
+        validate_cli_args(args)
