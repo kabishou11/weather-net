@@ -103,6 +103,89 @@ def test_greedy_search_ensemble_weights_keeps_or_improves_best_model() -> None:
     assert len(result.weights) == 2
 
 
+def test_bootstrap_macro_f1_summary_reports_mean_and_worst_quantile() -> None:
+    from src.weather_net.postprocess import bootstrap_macro_f1_summary
+
+    base_logits = np.array(
+        [
+            [3.0, 0.0],
+            [0.0, 3.0],
+            [3.0, 0.0],
+            [0.0, 3.0],
+        ],
+        dtype=np.float64,
+    )
+    improved_logits = base_logits.copy()
+    improved_logits[2] = [0.0, 3.0]
+    y_true = np.array([0, 1, 1, 1])
+
+    summary = bootstrap_macro_f1_summary(
+        baseline_logits=base_logits,
+        candidate_logits=improved_logits,
+        y_true=y_true,
+        class_names=["rain", "sunny"],
+        rounds=64,
+        sample_fraction=0.75,
+        seed=7,
+    )
+
+    assert summary["rounds"] == 64
+    assert summary["stratified"] == 1
+    assert summary["missing_class_rounds"] == 0
+    assert summary["candidate_mean_macro_f1"] >= summary["baseline_mean_macro_f1"]
+    assert summary["delta_mean_macro_f1"] >= 0
+    assert summary["delta_q05_macro_f1"] >= 0
+    assert 0 <= summary["candidate_q05_macro_f1"] <= 1
+
+
+def test_bootstrap_macro_f1_summary_keeps_tail_classes_when_stratified() -> None:
+    from src.weather_net.postprocess import bootstrap_macro_f1_summary
+
+    logits = np.array(
+        [
+            [3.0, 0.0],
+            [3.0, 0.0],
+            [3.0, 0.0],
+            [0.0, 3.0],
+        ],
+        dtype=np.float64,
+    )
+    y_true = np.array([0, 0, 0, 1])
+
+    summary = bootstrap_macro_f1_summary(
+        baseline_logits=logits,
+        candidate_logits=logits,
+        y_true=y_true,
+        class_names=["rain", "sunny"],
+        rounds=32,
+        sample_fraction=0.5,
+        seed=3,
+        stratified=True,
+    )
+
+    assert summary["stratified"] == 1
+    assert summary["missing_class_rounds"] == 0
+    assert summary["sample_size"] >= 2
+
+
+def test_bootstrap_macro_f1_summary_rejects_bad_arguments() -> None:
+    from src.weather_net.postprocess import bootstrap_macro_f1_summary
+
+    logits = np.array([[1.0, 0.0], [0.0, 1.0]])
+    y_true = np.array([0, 1])
+
+    with pytest.raises(ValueError, match="rounds"):
+        bootstrap_macro_f1_summary(logits, logits, y_true, ["rain", "sunny"], rounds=0)
+    with pytest.raises(ValueError, match="sample_fraction"):
+        bootstrap_macro_f1_summary(logits, logits, y_true, ["rain", "sunny"], sample_fraction=0.0)
+    with pytest.raises(ValueError, match="shape"):
+        bootstrap_macro_f1_summary(logits, logits[:1], y_true, ["rain", "sunny"])
+    with pytest.raises(ValueError, match="quantile"):
+        bootstrap_macro_f1_summary(logits, logits, y_true, ["rain", "sunny"], quantile=-0.1)
+    with pytest.raises(ValueError, match="empty"):
+        bootstrap_macro_f1_summary(logits[:0], logits[:0], y_true[:0], ["rain", "sunny"])
+
+
 def test_decision_params_round_trip_and_class_validation(tmp_path: Path) -> None:
     from src.weather_net.postprocess import load_decision_params, write_decision_params
 

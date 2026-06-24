@@ -10,6 +10,7 @@ import numpy as np
 
 from src.weather_net.postprocess import (
     apply_decision_params,
+    bootstrap_macro_f1_summary,
     greedy_search_ensemble_weights,
     macro_f1_from_logits,
     search_per_class_bias,
@@ -26,6 +27,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/decision/default"))
     parser.add_argument("--temperature", type=float, nargs="*", default=None)
     parser.add_argument("--max-ensemble-steps", type=int, default=12)
+    parser.add_argument("--bootstrap-rounds", type=int, default=0)
+    parser.add_argument("--bootstrap-sample-fraction", type=float, default=1.0)
+    parser.add_argument("--bootstrap-seed", type=int, default=42)
+    parser.add_argument("--bootstrap-min-delta-q05", type=float, default=0.0)
     return parser.parse_args()
 
 
@@ -167,6 +172,7 @@ def _write_report(
     temperature: float,
     bias: Sequence[float],
     scores: dict[str, float],
+    bootstrap: dict[str, float | int] | None = None,
 ) -> None:
     lines = [
         "# OOF Decision Report",
@@ -189,6 +195,17 @@ def _write_report(
         *[f"- {key}: {value:.6f}" for key, value in scores.items()],
         "",
     ]
+    if bootstrap is not None:
+        lines.extend(
+            [
+                "## Bootstrap Stability",
+                *[
+                    f"- {key}: {value:.6f}" if isinstance(value, float) else f"- {key}: {value}"
+                    for key, value in bootstrap.items()
+                ],
+                "",
+            ]
+        )
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
@@ -198,7 +215,15 @@ def run_oof_decision(
     temperature_candidates: Sequence[float] | None = None,
     max_ensemble_steps: int = 12,
     checkpoints: Sequence[Path] | None = None,
+    bootstrap_rounds: int = 0,
+    bootstrap_sample_fraction: float = 1.0,
+    bootstrap_seed: int = 42,
+    bootstrap_min_delta_q05: float = 0.0,
 ) -> dict[str, object]:
+    if bootstrap_rounds < 0:
+        raise ValueError("bootstrap_rounds must be non-negative")
+    if not 0 < bootstrap_sample_fraction <= 1:
+        raise ValueError("bootstrap_sample_fraction must be in (0, 1]")
     logits_by_model, y_true, class_names, checkpoint_groups = _load_aligned_oofs(oof_paths)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -225,18 +250,64 @@ def run_oof_decision(
         class_names,
         temperature=temperature,
     )
+    temperature_logits = apply_decision_params(
+        ensemble_logits,
+        temperature=temperature,
+    )
     tuned_logits = apply_decision_params(
         ensemble_logits,
         temperature=temperature,
         bias=bias_result.bias,
     )
     tuned_score = macro_f1_from_logits(tuned_logits, y_true, class_names)
+    bootstrap_summary = None
+    candidate_bias = [float(value) for value in bias_result.bias]
+    bias_accepted = True
+    if bootstrap_rounds > 0:
+        bootstrap_summary = bootstrap_macro_f1_summary(
+            baseline_logits=temperature_logits,
+            candidate_logits=tuned_logits,
+            y_true=y_true,
+            class_names=class_names,
+            rounds=bootstrap_rounds,
+            sample_fraction=bootstrap_sample_fraction,
+            seed=bootstrap_seed,
+        )
+        bias_accepted = float(bootstrap_summary["delta_q05_macro_f1"]) >= bootstrap_min_delta_q05
+        if not bias_accepted:
+            bias_result = type(bias_result)(
+                bias=[0.0 for _ in class_names],
+                score=float(temperature_score),
+                baseline_score=bias_result.baseline_score,
+            )
+            tuned_logits = temperature_logits
+            tuned_score = float(temperature_score)
+        bootstrap_summary = {
+            **bootstrap_summary,
+            "seed": int(bootstrap_seed),
+            "gate_threshold_delta_q05": float(bootstrap_min_delta_q05),
+            "bias_accepted": 1 if bias_accepted else 0,
+            "candidate_bias": candidate_bias,
+            "accepted_bias": [float(value) for value in bias_result.bias],
+        }
     scores = {
         "best_single_macro_f1": float(max(baseline_scores)),
         "ensemble_macro_f1": float(ensemble_result.score),
         "temperature_macro_f1": float(temperature_score),
         "tuned_macro_f1": float(tuned_score),
+        "bias_accepted": 1.0 if bias_accepted else 0.0,
     }
+    if bootstrap_summary is not None:
+        scores.update(
+            {
+                "bootstrap_rounds": float(bootstrap_rounds),
+                "bootstrap_sample_fraction": float(bootstrap_sample_fraction),
+                "bootstrap_seed": float(bootstrap_seed),
+                "bootstrap_gate_threshold_delta_q05": float(bootstrap_min_delta_q05),
+                "bootstrap_delta_q05_macro_f1": float(bootstrap_summary["delta_q05_macro_f1"]),
+                "bootstrap_delta_mean_macro_f1": float(bootstrap_summary["delta_mean_macro_f1"]),
+            }
+        )
     decision_checkpoints, decision_weights = _resolve_decision_checkpoints_and_weights(
         oof_paths=oof_paths,
         checkpoint_groups=checkpoint_groups,
@@ -262,6 +333,7 @@ def run_oof_decision(
         temperature=temperature,
         bias=bias_result.bias,
         scores=scores,
+        bootstrap=bootstrap_summary,
     )
     (output_dir / "oof_scorecard.json").write_text(
         json.dumps(
@@ -273,6 +345,7 @@ def run_oof_decision(
                 "decision_checkpoints": decision_checkpoints,
                 "decision_weights": decision_weights,
                 "scores": scores,
+                "bootstrap": bootstrap_summary,
             },
             indent=2,
             ensure_ascii=False,
@@ -288,6 +361,7 @@ def run_oof_decision(
         "temperature": temperature,
         "bias": bias_result.bias,
         "scores": scores,
+        "bootstrap": bootstrap_summary,
     }
 
 
@@ -299,6 +373,10 @@ def main() -> None:
         temperature_candidates=args.temperature,
         max_ensemble_steps=args.max_ensemble_steps,
         checkpoints=args.checkpoint,
+        bootstrap_rounds=args.bootstrap_rounds,
+        bootstrap_sample_fraction=args.bootstrap_sample_fraction,
+        bootstrap_seed=args.bootstrap_seed,
+        bootstrap_min_delta_q05=args.bootstrap_min_delta_q05,
     )
     print(json.dumps(stats, indent=2, ensure_ascii=False))
 

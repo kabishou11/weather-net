@@ -118,6 +118,9 @@ oof_metrics.json
 python3 oof_decide.py \
   --oof outputs/convnext_tiny/oof/oof_probabilities.npz \
   --checkpoint outputs/convnext_tiny/convnext_tiny_fold0.pt outputs/convnext_tiny/convnext_tiny_fold1.pt outputs/convnext_tiny/convnext_tiny_fold2.pt \
+  --bootstrap-rounds 200 \
+  --bootstrap-sample-fraction 0.8 \
+  --bootstrap-min-delta-q05 0.0 \
   --output-dir outputs/decision/exp001
 ```
 
@@ -131,6 +134,8 @@ python3 oof_decide.py \
 ```
 
 输出的 `decision_params.json` 是提交前的冻结决策产物，避免只凭单次验证分数手填权重。若 `oof_probabilities.npz` 来自 K 折训练，文件内会记录每条 OOF 预测对应的 fold checkpoint；`oof_decide.py` 会把 OOF 组权重自动展开为每个 fold checkpoint 的推理权重。线上推理时请传入同一组 fold checkpoint，顺序需与 `decision_params.json` 绑定一致。
+
+`--bootstrap-rounds` 会对 OOF 样本做分层有放回重采样，评估 per-class bias 相对 temperature-only 结果的稳定增益；若 `delta_q05_macro_f1` 低于 `--bootstrap-min-delta-q05`，会自动回退 bias，避免把 OOF 偶然性写进提交参数。这个步骤只影响决策参数搜索，不增加线上推理成本；不传 bootstrap 参数时保持旧行为，不启用门控。
 
 ## 伪标签
 

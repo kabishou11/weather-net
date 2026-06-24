@@ -55,6 +55,88 @@ def macro_f1_from_logits(
     return classification_report(list(y_true), predictions, class_names).macro_f1
 
 
+def bootstrap_macro_f1_summary(
+    baseline_logits: np.ndarray | Sequence[Sequence[float]],
+    candidate_logits: np.ndarray | Sequence[Sequence[float]],
+    y_true: np.ndarray | Sequence[int],
+    class_names: Sequence[str],
+    rounds: int = 200,
+    sample_fraction: float = 1.0,
+    seed: int = 42,
+    quantile: float = 0.05,
+    stratified: bool = True,
+) -> dict[str, float | int]:
+    baseline = _as_2d_logits(baseline_logits)
+    candidate = _as_2d_logits(candidate_logits)
+    labels = np.asarray(y_true, dtype=np.int64)
+    if baseline.shape != candidate.shape:
+        raise ValueError("baseline_logits and candidate_logits must have the same shape")
+    if baseline.shape[0] != labels.shape[0]:
+        raise ValueError("logits and y_true must have the same number of rows")
+    if baseline.shape[1] != len(class_names):
+        raise ValueError("logits class dimension must match class_names")
+    if rounds <= 0:
+        raise ValueError("rounds must be positive")
+    if not 0 < sample_fraction <= 1:
+        raise ValueError("sample_fraction must be in (0, 1]")
+    if not 0 <= quantile <= 1:
+        raise ValueError("quantile must be in [0, 1]")
+    if labels.size == 0:
+        raise ValueError("y_true cannot be empty")
+
+    rng = np.random.default_rng(seed)
+    present_classes = sorted(int(label) for label in np.unique(labels).tolist())
+    sample_size = max(1, int(round(labels.size * float(sample_fraction))))
+    if stratified:
+        per_class_indices = [np.flatnonzero(labels == class_idx) for class_idx in present_classes]
+        sample_size = sum(
+            max(1, int(round(len(indices) * float(sample_fraction))))
+            for indices in per_class_indices
+        )
+    baseline_scores: list[float] = []
+    candidate_scores: list[float] = []
+    deltas: list[float] = []
+    missing_class_rounds = 0
+    for _ in range(rounds):
+        if stratified:
+            sampled_by_class = [
+                rng.choice(
+                    indices,
+                    size=max(1, int(round(len(indices) * float(sample_fraction)))),
+                    replace=True,
+                )
+                for indices in per_class_indices
+            ]
+            indices = np.concatenate(sampled_by_class)
+            rng.shuffle(indices)
+        else:
+            indices = rng.integers(0, labels.size, size=sample_size)
+        if len(set(labels[indices].astype(int).tolist())) < len(present_classes):
+            missing_class_rounds += 1
+        baseline_score = macro_f1_from_logits(baseline[indices], labels[indices], class_names)
+        candidate_score = macro_f1_from_logits(candidate[indices], labels[indices], class_names)
+        baseline_scores.append(baseline_score)
+        candidate_scores.append(candidate_score)
+        deltas.append(candidate_score - baseline_score)
+
+    baseline_array = np.asarray(baseline_scores, dtype=np.float64)
+    candidate_array = np.asarray(candidate_scores, dtype=np.float64)
+    delta_array = np.asarray(deltas, dtype=np.float64)
+    return {
+        "rounds": int(rounds),
+        "sample_fraction": float(sample_fraction),
+        "sample_size": int(sample_size),
+        "stratified": 1 if stratified else 0,
+        "missing_class_rounds": int(missing_class_rounds),
+        "baseline_mean_macro_f1": float(baseline_array.mean()),
+        "candidate_mean_macro_f1": float(candidate_array.mean()),
+        "delta_mean_macro_f1": float(delta_array.mean()),
+        "baseline_q05_macro_f1": float(np.quantile(baseline_array, quantile)),
+        "candidate_q05_macro_f1": float(np.quantile(candidate_array, quantile)),
+        "delta_q05_macro_f1": float(np.quantile(delta_array, quantile)),
+    }
+
+
 def apply_decision_params(
     logits: np.ndarray | Sequence[Sequence[float]],
     temperature: float = 1.0,
