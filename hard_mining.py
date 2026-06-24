@@ -16,6 +16,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--error-boost", type=float, default=1.0)
     parser.add_argument("--low-margin-boost", type=float, default=0.5)
     parser.add_argument("--high-loss-boost", type=float, default=0.5)
+    parser.add_argument("--pair-confusion-boost", type=float, default=0.0)
+    parser.add_argument("--pair-min-support", type=int, default=2)
+    parser.add_argument("--pair-min-error-share", type=float, default=0.0)
     parser.add_argument("--low-margin-threshold", type=float, default=0.1)
     parser.add_argument("--high-loss-quantile", type=float, default=0.75)
     parser.add_argument("--max-weight", type=float, default=2.5)
@@ -32,6 +35,9 @@ def main() -> None:
         error_boost=args.error_boost,
         low_margin_boost=args.low_margin_boost,
         high_loss_boost=args.high_loss_boost,
+        pair_confusion_boost=args.pair_confusion_boost,
+        pair_min_support=args.pair_min_support,
+        pair_min_error_share=args.pair_min_error_share,
         low_margin_threshold=args.low_margin_threshold,
         high_loss_quantile=args.high_loss_quantile,
         max_weight=args.max_weight,

@@ -20,6 +20,7 @@ class HardSample:
     loss: float
     true_label: str
     pred_label: str
+    confusion_pair: str = ""
 
 
 def _read_csv(path: Path) -> list[dict[str, str]]:
@@ -54,6 +55,9 @@ def compute_hard_sample_weights(
     error_boost: float = 1.0,
     low_margin_boost: float = 0.5,
     high_loss_boost: float = 0.5,
+    pair_confusion_boost: float = 0.0,
+    pair_min_support: int = 2,
+    pair_min_error_share: float = 0.0,
     low_margin_threshold: float = 0.1,
     high_loss_quantile: float = 0.75,
     max_weight: float = 2.5,
@@ -61,8 +65,12 @@ def compute_hard_sample_weights(
     _validate_oof_records(records)
     if base_weight <= 0:
         raise ValueError("base_weight must be positive")
-    if error_boost < 0 or low_margin_boost < 0 or high_loss_boost < 0:
+    if error_boost < 0 or low_margin_boost < 0 or high_loss_boost < 0 or pair_confusion_boost < 0:
         raise ValueError("boost values must be non-negative")
+    if pair_min_support < 1:
+        raise ValueError("pair_min_support must be positive")
+    if not 0 <= pair_min_error_share <= 1:
+        raise ValueError("pair_min_error_share must be in [0, 1]")
     if low_margin_threshold < 0:
         raise ValueError("low_margin_threshold must be non-negative")
     if not 0 <= high_loss_quantile <= 1:
@@ -74,6 +82,24 @@ def compute_hard_sample_weights(
     if not np.isfinite(losses).all():
         raise ValueError("OOF losses must be finite")
     loss_threshold = float(np.quantile(losses, high_loss_quantile))
+    pair_counts = Counter(
+        (
+            str(record["true_label"]).strip(),
+            str(record["pred_label"]).strip(),
+        )
+        for record in records
+        if not _truthy(record["correct"])
+        and str(record["true_label"]).strip()
+        and str(record["pred_label"]).strip()
+        and str(record["true_label"]).strip() != str(record["pred_label"]).strip()
+    )
+    true_error_counts = Counter(true_label for true_label, _pred_label in pair_counts.elements())
+    supported_pairs = {
+        pair
+        for pair, count in pair_counts.items()
+        if count >= pair_min_support
+        and (count / max(1, true_error_counts[pair[0]])) >= pair_min_error_share
+    }
 
     weights: dict[str, HardSample] = {}
     for record in records:
@@ -81,6 +107,9 @@ def compute_hard_sample_weights(
         confidence = float(record["confidence"])
         margin = float(record["margin"])
         loss = float(record["loss"])
+        true_label = str(record["true_label"]).strip()
+        pred_label = str(record["pred_label"]).strip()
+        confusion_pair = f"{true_label}->{pred_label}" if true_label != pred_label else ""
         if not all(math.isfinite(value) for value in [confidence, margin, loss]):
             raise ValueError(f"OOF numeric values must be finite: {image_id}")
         reasons: list[str] = []
@@ -88,10 +117,13 @@ def compute_hard_sample_weights(
         if not _truthy(record["correct"]):
             sample_weight += error_boost
             reasons.append("error")
-        if margin <= low_margin_threshold:
+            if (true_label, pred_label) in supported_pairs and pair_confusion_boost > 0:
+                sample_weight += pair_confusion_boost
+                reasons.append(f"pair_confusion:{confusion_pair}")
+        if margin <= low_margin_threshold and low_margin_boost > 0:
             sample_weight += low_margin_boost
             reasons.append("low_margin")
-        if loss >= loss_threshold:
+        if loss >= loss_threshold and high_loss_boost > 0:
             sample_weight += high_loss_boost
             reasons.append("high_loss")
         sample_weight = min(max_weight, sample_weight)
@@ -102,8 +134,9 @@ def compute_hard_sample_weights(
             confidence=confidence,
             margin=margin,
             loss=loss,
-            true_label=str(record["true_label"]).strip(),
-            pred_label=str(record["pred_label"]).strip(),
+            true_label=true_label,
+            pred_label=pred_label,
+            confusion_pair=confusion_pair,
         )
     return weights
 
@@ -137,6 +170,7 @@ def _write_hard_csv(output_csv: Path, rows: Sequence[dict[str, str]]) -> None:
         "margin",
         "loss",
         "prediction",
+        "confusion_pair",
     ]
     with output_csv.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -152,6 +186,9 @@ def apply_hard_mining_weights(
     error_boost: float = 1.0,
     low_margin_boost: float = 0.5,
     high_loss_boost: float = 0.5,
+    pair_confusion_boost: float = 0.0,
+    pair_min_support: int = 2,
+    pair_min_error_share: float = 0.0,
     low_margin_threshold: float = 0.1,
     high_loss_quantile: float = 0.75,
     max_weight: float = 2.5,
@@ -173,6 +210,9 @@ def apply_hard_mining_weights(
         error_boost=error_boost,
         low_margin_boost=low_margin_boost,
         high_loss_boost=high_loss_boost,
+        pair_confusion_boost=pair_confusion_boost,
+        pair_min_support=pair_min_support,
+        pair_min_error_share=pair_min_error_share,
         low_margin_threshold=low_margin_threshold,
         high_loss_quantile=high_loss_quantile,
         max_weight=max_weight,
@@ -180,6 +220,7 @@ def apply_hard_mining_weights(
 
     updated = 0
     skipped_pseudo = 0
+    pair_confusion_boosted = 0
     hard_rows: list[dict[str, str]] = []
     for row in train_rows:
         image_id = str(row["image"]).strip()
@@ -196,6 +237,8 @@ def apply_hard_mining_weights(
         row["sample_weight"] = f"{hard_sample.sample_weight:.6f}"
         if hard_sample.sample_weight > 1.0:
             updated += 1
+            if "pair_confusion:" in hard_sample.hard_reason:
+                pair_confusion_boosted += 1
             hard_rows.append(
                 {
                     "image": image_id,
@@ -206,6 +249,7 @@ def apply_hard_mining_weights(
                     "margin": f"{hard_sample.margin:.6f}",
                     "loss": f"{hard_sample.loss:.6f}",
                     "prediction": hard_sample.pred_label,
+                    "confusion_pair": hard_sample.confusion_pair,
                 }
             )
 
@@ -217,4 +261,5 @@ def apply_hard_mining_weights(
         "updated": updated,
         "hard": len(hard_rows),
         "skipped_pseudo": skipped_pseudo,
+        "pair_confusion_boosted": pair_confusion_boosted,
     }
