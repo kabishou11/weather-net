@@ -12,6 +12,7 @@ class DataConfig:
     train_dir: Path | None = None
     train_csv: Path | None = None
     image_root: Path | None = None
+    external_audit_json: Path | None = None
     test_dir: Path | None = None
     test_csv: Path | None = None
     image_column: str | None = None

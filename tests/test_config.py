@@ -105,6 +105,21 @@ def test_load_config_accepts_sample_weight_usage(tmp_path: Path) -> None:
     assert config.train.sample_weight_usage == "sampler"
 
 
+def test_load_config_accepts_external_audit_json_path(tmp_path: Path) -> None:
+    from src.weather_net.config import load_config
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "data:\n"
+        "  external_audit_json: outputs/preflight_train_with_external_common5_audit.json\n",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert config.data.external_audit_json == Path("outputs/preflight_train_with_external_common5_audit.json")
+
+
 def test_load_config_accepts_distillation_options(tmp_path: Path) -> None:
     from src.weather_net.config import load_config
 

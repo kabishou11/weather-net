@@ -496,7 +496,7 @@ python3 external_dataset_manifest.py \
   --dataset-url "https://www.kaggle.com/datasets/wjybuqi/weathertime-classification-with-road-images" \
   --license "Kaggle dataset; verify competition terms before redistribution" \
   --label-map-preset road_weather_time \
-  --class-map outputs/convnextv2_384/class_to_idx.json \
+  --allowed-labels cloudy fog rain snow sunny \
   --sample-weight 0.5 \
   --output-csv data/external/road_weather_time_kaggle/external_train.csv \
   --summary-json data/external/road_weather_time_kaggle/summary.json
@@ -512,7 +512,7 @@ python3 external_dataset_manifest.py \
   --license "CC BY 4.0" \
   --doi 10.17632/4drtyfjtfy.1 \
   --label-map-preset mwd \
-  --class-map outputs/convnextv2_384/class_to_idx.json \
+  --allowed-labels cloudy fog rain snow sunny \
   --sample-weight 0.3 \
   --output-csv data/external/mwd_kaggle/external_train.csv \
   --summary-json data/external/mwd_kaggle/summary.json
@@ -523,7 +523,7 @@ python3 external_dataset_manifest.py \
   --dataset-url "https://www.kaggle.com/datasets/vijaygiitk/multiclass-weather-dataset" \
   --license "Kaggle dataset; verify competition terms before redistribution" \
   --label-map-preset vijay_mwd \
-  --class-map outputs/convnextv2_384/class_to_idx.json \
+  --allowed-labels cloudy fog rain snow sunny \
   --skip-reserved-splits \
   --sample-weight 0.2 \
   --output-csv data/external/vijay_multiclass_weather_kaggle/external_train.csv \
@@ -536,13 +536,14 @@ python3 external_dataset_manifest.py \
   --license CC0 \
   --doi 10.7910/DVN/M8JQCR \
   --label-map-preset weapd \
-  --class-map outputs/convnextv2_384/class_to_idx.json \
+  --allowed-labels cloudy fog rain snow sunny \
+  --drop-unmapped \
   --sample-weight 0.1 \
   --output-csv data/external/weapd_kaggle/external_train.csv \
   --summary-json data/external/weapd_kaggle/summary.json
 ```
 
-如果官方类别不包含 `dew/lightning/rainbow/sandstorm` 这类标签，`--class-map` 会直接阻止它们进入 manifest；可用自定义 JSON 映射并开启 `--drop-unmapped`，只保留能对齐官方类别的样本。summary 会记录 `dataset_url/license/doi/label_map_sha256/sample_weight`，便于赛前审计数据来源。外部 manifest 会显式写出 `sample_weight`；preflight 看到 `source=external_*` 且缺少该列会失败，避免外部数据被默认等权训练。
+拿到官方训练集并生成官方 `class_to_idx.json` 后，可把上面的 `--allowed-labels ...` 替换为 `--class-map outputs/convnextv2_384/class_to_idx.json` 重建一遍 manifest。没有官方映射时不要在文档或脚本里硬编码不存在的 `outputs/.../class_to_idx.json`；当前已落地的 `external_train_dedup_common5.csv` 是按常见五类过滤出的可复现兜底版本。如果官方类别不包含 `dew/lightning/rainbow/sandstorm` 这类标签，`--class-map` 会直接阻止它们进入 manifest；也可以用自定义 JSON 映射并开启 `--drop-unmapped`，只保留能对齐官方类别的样本。summary 会记录 `dataset_url/license/doi/label_map_sha256/sample_weight`，便于赛前审计数据来源。外部 manifest 会显式写出 `sample_weight`；preflight 看到 `source=external_*` 且缺少该列会失败，避免外部数据被默认等权训练。
 
 外部数据默认不直接等权并入官方训练集。推荐路线：官方 5-fold OOF 强基线 -> OOF hard mining -> 只加 Road Weather-Time `sample_weight 0.3/0.5` 做 3-fold A/B -> 再考虑伪标签 + embedding guard。WEAPD 和 Vijay 优先导出 DINOv2/CLIP/timm embedding 给 `embedding_guard.py` 做语义裁判或异常分析；只有当官方某类明显缺样本时，再用低权重、小比例补充。若比赛规则禁止外部数据，则这些数据只能用于本地鲁棒性分析，不进入最终训练。
 
@@ -565,6 +566,35 @@ python3 dedupe_external_manifests.py \
 ```
 
 当前审计结果：输入 12087 行，保留 10749 行，拒绝重复 hash 1338 行；其中 Vijay 被拒绝 1124 行，说明它和 MWD 高度同源，不能与 MWD 等权重复混训。
+
+把官方训练集和外部去重集真正合并前，必须再以官方训练图为最高优先级做一次内容哈希去重和外部配额控制。推荐先只加 `external_train_dedup_common5.csv`，每个类别的外部样本数不超过官方该类样本数的 `1.0` 倍，且外部权重最多 `0.5`：
+
+```bash
+python3 merge_external_training.py \
+  --train-csv data/train.csv \
+  --image-root data/images \
+  --external-csv data/external/external_train_dedup_common5.csv \
+  --external-image-root . \
+  --output-image-root . \
+  --max-external-per-labeled-class-ratio 1.0 \
+  --max-external-sample-weight 0.5 \
+  --max-external-effective-weight-share 0.35 \
+  --clip-external-sample-weight \
+  --output-csv data/train_with_external_common5.csv \
+  --rejected-csv data/train_with_external_common5_rejected.csv \
+  --audit-json outputs/preflight_train_with_external_common5_audit.json
+```
+
+这个合并工具会保留全部官方样本；外部样本若与官方图或更高优先级外部图内容重复，会进入 rejected CSV；外部标签不在官方类别空间内会默认过滤；`--max-external-effective-weight-share` 会按 `sample_weight` 限制外部数据在有效训练权重里的占比。随后再对 `data/train_with_external_common5.csv` 跑 `training_preflight.py --allow-external-data --check-unique-image-hash`，确认没有重复内容、外部权重和比例都在闸门内。训练配置若使用该合并 CSV，必须设置：
+
+```yaml
+data:
+  train_csv: data/train_with_external_common5.csv
+  image_root: .
+  external_audit_json: outputs/preflight_train_with_external_common5_audit.json
+```
+
+训练入口会 fail-closed：只要 CSV 中包含 `source=external` 或 `external_*`，但没有匹配 `merge_external_training.py` 产出的 audit，就会拒绝开训，避免把外部-only 或未经官方去重的 CSV 跑成一次长训练。
 
 ## 一次性服务器训练路线
 

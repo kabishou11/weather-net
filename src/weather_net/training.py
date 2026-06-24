@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import random
 import re
@@ -180,6 +181,93 @@ def load_training_manifest(config: AppConfig) -> tuple[list[ManifestRow], dict[s
             label_column=config.data.label_column,
         )
     raise ValueError("Set data.train_dir or data.train_csv")
+
+
+def _is_external_source(source: str) -> bool:
+    return source == "external" or source.startswith("external_")
+
+
+def _resolve_audit_output_csv(value: object) -> Path:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("external merge audit is missing output_csv")
+    return Path(value).expanduser().resolve()
+
+
+def _hash_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _row_digest(row: ManifestRow) -> str:
+    payload = {
+        "image": row.image_id or str(row.path),
+        "label": row.label_name or "",
+        "source": row.source,
+        "confidence": f"{row.confidence:.6f}",
+        "sample_weight": f"{row.sample_weight:.6f}",
+        "content_sha256": _hash_file(row.path),
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def validate_external_merge_audit(rows: Sequence[ManifestRow], config: AppConfig) -> dict[str, object] | None:
+    source_counts: dict[str, int] = {}
+    for row in rows:
+        source_counts[row.source] = source_counts.get(row.source, 0) + 1
+    if not any(_is_external_source(source) for source in source_counts):
+        return None
+
+    audit_path = config.data.external_audit_json
+    if audit_path is None:
+        raise ValueError(
+            "external merge audit is required when training data contains external rows; "
+            "set data.external_audit_json to the JSON produced by merge_external_training.py"
+        )
+    audit_path = audit_path.expanduser().resolve()
+    if not audit_path.exists():
+        raise ValueError(f"external merge audit does not exist: {audit_path}")
+    try:
+        audit = json.loads(audit_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        raise ValueError(f"external merge audit is not valid JSON: {audit_path}") from error
+    if not isinstance(audit, dict):
+        raise ValueError("external merge audit must be a JSON object")
+
+    if config.data.train_csv is not None:
+        expected_csv = config.data.train_csv.expanduser().resolve()
+        audited_csv = _resolve_audit_output_csv(audit.get("output_csv"))
+        if audited_csv != expected_csv:
+            raise ValueError(
+                "external merge audit output_csv does not match data.train_csv: "
+                f"{audited_csv} != {expected_csv}"
+            )
+    if int(audit.get("kept_external_rows", -1)) <= 0:
+        raise ValueError("external merge audit reports no kept external rows")
+    audit_source_counts = audit.get("source_counts")
+    if not isinstance(audit_source_counts, dict):
+        raise ValueError("external merge audit is missing source_counts")
+    normalized_audit_source_counts = {str(source): int(count) for source, count in audit_source_counts.items()}
+    if normalized_audit_source_counts != source_counts:
+        raise ValueError(
+            "external merge audit source_counts do not match training manifest: "
+            f"{normalized_audit_source_counts} != {source_counts}"
+        )
+    audit_row_digests = audit.get("row_digest_sha256")
+    if not isinstance(audit_row_digests, list) or not all(isinstance(value, str) for value in audit_row_digests):
+        raise ValueError("external merge audit is missing row_digest_sha256")
+    current_row_digests = [_row_digest(row) for row in rows]
+    if audit_row_digests != current_row_digests:
+        raise ValueError("external merge audit row_digest_sha256 does not match current training manifest")
+    return {
+        "path": str(audit_path),
+        "kept_external_rows": int(audit["kept_external_rows"]),
+        "source_counts": dict(sorted(normalized_audit_source_counts.items())),
+        "row_digest_sha256": audit_row_digests,
+        "effective_weight": audit.get("effective_weight"),
+    }
 
 
 def _decay_layer_id(name: str, head_layer_id: int | None = None) -> int:
@@ -957,6 +1045,7 @@ def train_config(config: AppConfig, device_request: str = "auto") -> list[Path]:
     seed_everything(config.data.seed)
     device = resolve_device(device_request)
     rows, class_to_idx = load_training_manifest(config)
+    external_merge_audit = validate_external_merge_audit(rows, config)
     class_names = idx_to_class(class_to_idx)
     output_dir = config.train.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1137,22 +1226,28 @@ def train_config(config: AppConfig, device_request: str = "auto") -> list[Path]:
         )
 
     if all_oof_records:
+        metadata: dict[str, object] = {
+            "folds_requested": config.data.folds,
+            "folds_actual": len(summary),
+            "seed": config.data.seed,
+            "model_name": config.model.name,
+            "image_size": config.model.image_size,
+            "transform_backend": config.data.transform_backend,
+            "checkpoints": [str(path) for path in checkpoint_paths],
+        }
+        if external_merge_audit is not None:
+            metadata["external_merge_audit"] = external_merge_audit
         write_oof_artifacts(
             output_dir=output_dir / "oof",
             records=all_oof_records,
             class_names=class_names,
             class_to_idx=class_to_idx,
-            metadata={
-                "folds_requested": config.data.folds,
-                "folds_actual": len(summary),
-                "seed": config.data.seed,
-                "model_name": config.model.name,
-                "image_size": config.model.image_size,
-                "transform_backend": config.data.transform_backend,
-                "checkpoints": [str(path) for path in checkpoint_paths],
-            },
+            metadata=metadata,
         )
 
+    if external_merge_audit is not None:
+        for item in summary:
+            item["external_merge_audit"] = external_merge_audit
     (output_dir / "training_summary.json").write_text(
         json.dumps(summary, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",

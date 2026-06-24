@@ -193,3 +193,325 @@ def test_train_config_passes_optimizer_group_options(monkeypatch, tmp_path) -> N
 
     assert seen["no_weight_decay"] is True
     assert seen["layer_decay"] == 0.85
+
+
+def test_training_rejects_external_rows_without_merge_audit(monkeypatch, tmp_path) -> None:
+    import pytest
+
+    from src.weather_net.config import AppConfig
+    from src.weather_net.data import ManifestRow
+    from src.weather_net import training
+
+    def fake_manifest(_config):
+        rows = [
+            ManifestRow(path=tmp_path / "rain.jpg", label=0, label_name="rain", image_id="rain.jpg"),
+            ManifestRow(
+                path=tmp_path / "external.jpg",
+                label=0,
+                label_name="rain",
+                image_id="external.jpg",
+                source="external_weapd",
+                sample_weight=0.2,
+            ),
+        ]
+        return rows, {"rain": 0}
+
+    monkeypatch.setattr(training, "load_training_manifest", fake_manifest)
+    config = AppConfig()
+    config.data.train_csv = tmp_path / "train_with_external.csv"
+    config.train.output_dir = tmp_path / "outputs"
+
+    with pytest.raises(ValueError, match="external merge audit"):
+        training.train_config(config, device_request="cpu")
+
+
+def test_training_accepts_external_rows_with_matching_merge_audit(monkeypatch, tmp_path) -> None:
+    import torch
+    from torch import nn
+    from PIL import Image
+
+    from src.weather_net.config import AppConfig
+    from src.weather_net.data import build_manifest_from_csv
+    from src.weather_net.metrics import ClassificationReport
+    from src.weather_net import training
+    from merge_external_training import merge_labeled_with_external_data
+
+    def fake_manifest(_config):
+        return build_manifest_from_csv(merged_csv)
+
+    def fake_loaders(train_rows, val_rows, **_kwargs):
+        return object(), object()
+
+    class TinyModel(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.head = nn.Linear(1, 1)
+
+    monkeypatch.setattr(training, "load_training_manifest", fake_manifest)
+    monkeypatch.setattr(training, "make_loaders", fake_loaders)
+    monkeypatch.setattr(training, "create_classifier", lambda *_args, **_kwargs: TinyModel())
+    monkeypatch.setattr(training, "build_optimizer", lambda model, *_args, **_kwargs: torch.optim.SGD(model.parameters(), lr=0.1))
+    monkeypatch.setattr(training, "train_one_epoch", lambda *_args, **_kwargs: 0.1)
+    monkeypatch.setattr(
+        training,
+        "evaluate",
+        lambda *_args, **_kwargs: (
+            ClassificationReport(
+                macro_f1=1.0,
+                accuracy=1.0,
+                per_class_f1={"rain": 1.0},
+                confusion_matrix=[[1]],
+            ),
+            0.1,
+        ),
+    )
+    monkeypatch.setattr(training, "save_checkpoint", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(training, "collect_oof_predictions", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(training, "write_oof_artifacts", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(training.torch, "load", lambda *_args, **_kwargs: {"model_state": TinyModel().state_dict()})
+
+    class NoopScheduler:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        def step(self) -> None:
+            pass
+
+    monkeypatch.setattr(training.torch.optim.lr_scheduler, "CosineAnnealingLR", NoopScheduler)
+
+    official_root = tmp_path / "official"
+    external_root = tmp_path / "external"
+    official_root.mkdir()
+    external_root.mkdir()
+    Image.new("RGB", (8, 8), (10, 20, 30)).save(official_root / "rain.jpg")
+    Image.new("RGB", (8, 8), (11, 21, 31)).save(external_root / "rain_extra.jpg")
+    train_csv = tmp_path / "official.csv"
+    train_csv.write_text("image,label\nrain.jpg,rain\n", encoding="utf-8")
+    external_csv = tmp_path / "external.csv"
+    external_csv.write_text(
+        "image,label,source,sample_weight\n"
+        "rain_extra.jpg,rain,external_weapd,0.2\n",
+        encoding="utf-8",
+    )
+    merged_csv = tmp_path / "train_with_external.csv"
+    audit_json = tmp_path / "audit.json"
+    merge_labeled_with_external_data(
+        train_csv=train_csv,
+        train_dir=None,
+        image_root=official_root,
+        external_csv=external_csv,
+        external_image_root=external_root,
+        output_csv=merged_csv,
+        rejected_csv=tmp_path / "rejected.csv",
+        audit_json=audit_json,
+    )
+    config = AppConfig()
+    config.data.train_csv = merged_csv
+    config.data.external_audit_json = audit_json
+    config.data.folds = 1
+    config.train.epochs = 1
+    config.train.output_dir = tmp_path / "outputs"
+
+    training.train_config(config, device_request="cpu")
+
+    assert (config.train.output_dir / "training_summary.json").exists()
+
+
+def test_external_merge_audit_matches_relative_train_csv_from_cwd(tmp_path, monkeypatch) -> None:
+    from pathlib import Path
+    from PIL import Image
+
+    from src.weather_net.config import AppConfig
+    from src.weather_net.data import build_manifest_from_csv
+    from src.weather_net.training import validate_external_merge_audit
+    from merge_external_training import merge_labeled_with_external_data
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "data").mkdir()
+    (tmp_path / "outputs").mkdir()
+    (tmp_path / "official").mkdir()
+    (tmp_path / "external").mkdir()
+    Image.new("RGB", (8, 8), (10, 20, 30)).save(tmp_path / "official" / "rain.jpg")
+    Image.new("RGB", (8, 8), (11, 21, 31)).save(tmp_path / "external" / "rain_extra.jpg")
+    Path("official.csv").write_text("image,label\nrain.jpg,rain\n", encoding="utf-8")
+    Path("external.csv").write_text(
+        "image,label,source,sample_weight\n"
+        "rain_extra.jpg,rain,external_weapd,0.5\n",
+        encoding="utf-8",
+    )
+    train_csv = Path("data/train_with_external.csv")
+    audit_json = Path("outputs/audit.json")
+    merge_labeled_with_external_data(
+        train_csv=Path("official.csv"),
+        train_dir=None,
+        image_root=Path("official"),
+        external_csv=Path("external.csv"),
+        external_image_root=Path("external"),
+        output_csv=train_csv,
+        rejected_csv=Path("outputs/rejected.csv"),
+        audit_json=audit_json,
+    )
+    rows, _class_to_idx = build_manifest_from_csv(train_csv)
+    config = AppConfig()
+    config.data.train_csv = train_csv
+    config.data.external_audit_json = audit_json
+
+    result = validate_external_merge_audit(rows, config)
+
+    assert result is not None
+    assert result["kept_external_rows"] == 1
+
+
+def test_external_merge_audit_rejects_stale_source_counts(tmp_path) -> None:
+    import json
+    import pytest
+
+    from src.weather_net.config import AppConfig
+    from src.weather_net.data import ManifestRow
+    from src.weather_net.training import validate_external_merge_audit
+
+    train_csv = tmp_path / "train_with_external.csv"
+    audit_json = tmp_path / "audit.json"
+    audit_json.write_text(
+        json.dumps(
+            {
+                "output_csv": str(train_csv),
+                "kept_external_rows": 1,
+                "source_counts": {"labeled": 1, "external_weapd": 2},
+            }
+        ),
+        encoding="utf-8",
+    )
+    rows = [
+        ManifestRow(path=tmp_path / "rain.jpg", label=0, label_name="rain", source="labeled"),
+        ManifestRow(path=tmp_path / "external.jpg", label=0, label_name="rain", source="external_weapd"),
+    ]
+    config = AppConfig()
+    config.data.train_csv = train_csv
+    config.data.external_audit_json = audit_json
+
+    with pytest.raises(ValueError, match="source_counts"):
+        validate_external_merge_audit(rows, config)
+
+
+def test_external_merge_audit_rejects_missing_row_digest(tmp_path) -> None:
+    import json
+    import pytest
+    from PIL import Image
+
+    from src.weather_net.config import AppConfig
+    from src.weather_net.data import build_manifest_from_csv
+    from src.weather_net.training import validate_external_merge_audit
+
+    Image.new("RGB", (8, 8), (10, 20, 30)).save(tmp_path / "rain.jpg")
+    Image.new("RGB", (8, 8), (11, 21, 31)).save(tmp_path / "external.jpg")
+    train_csv = tmp_path / "train_with_external.csv"
+    train_csv.write_text(
+        "image,label,source,sample_weight\n"
+        "rain.jpg,rain,labeled,1.0\n"
+        "external.jpg,rain,external_weapd,0.5\n",
+        encoding="utf-8",
+    )
+    audit_json = tmp_path / "audit.json"
+    audit_json.write_text(
+        json.dumps(
+            {
+                "output_csv": str(train_csv),
+                "kept_external_rows": 1,
+                "source_counts": {"labeled": 1, "external_weapd": 1},
+            }
+        ),
+        encoding="utf-8",
+    )
+    rows, _class_to_idx = build_manifest_from_csv(train_csv)
+    config = AppConfig()
+    config.data.train_csv = train_csv
+    config.data.external_audit_json = audit_json
+
+    with pytest.raises(ValueError, match="row_digest_sha256"):
+        validate_external_merge_audit(rows, config)
+
+
+def test_external_merge_audit_rejects_extra_stale_sources(tmp_path) -> None:
+    import json
+    import pytest
+
+    from src.weather_net.config import AppConfig
+    from src.weather_net.data import ManifestRow
+    from src.weather_net.training import validate_external_merge_audit
+
+    train_csv = tmp_path / "train_with_external.csv"
+    audit_json = tmp_path / "audit.json"
+    audit_json.write_text(
+        json.dumps(
+            {
+                "output_csv": str(train_csv),
+                "kept_external_rows": 1,
+                "source_counts": {"labeled": 1, "external_weapd": 1, "external_mwd": 10},
+            }
+        ),
+        encoding="utf-8",
+    )
+    rows = [
+        ManifestRow(path=tmp_path / "rain.jpg", label=0, label_name="rain", source="labeled"),
+        ManifestRow(path=tmp_path / "external.jpg", label=0, label_name="rain", source="external_weapd"),
+    ]
+    config = AppConfig()
+    config.data.train_csv = train_csv
+    config.data.external_audit_json = audit_json
+
+    with pytest.raises(ValueError, match="source_counts"):
+        validate_external_merge_audit(rows, config)
+
+
+def test_external_merge_audit_rejects_csv_content_changed_after_merge(tmp_path) -> None:
+    import csv
+    import pytest
+    from PIL import Image
+
+    from merge_external_training import merge_labeled_with_external_data
+    from src.weather_net.config import AppConfig
+    from src.weather_net.data import build_manifest_from_csv
+    from src.weather_net.training import validate_external_merge_audit
+
+    official_root = tmp_path / "official"
+    external_root = tmp_path / "external"
+    official_root.mkdir()
+    external_root.mkdir()
+    Image.new("RGB", (8, 8), (10, 20, 30)).save(official_root / "rain.jpg")
+    Image.new("RGB", (8, 8), (11, 21, 31)).save(external_root / "rain_extra.jpg")
+    train_csv = tmp_path / "official.csv"
+    train_csv.write_text("image,label\nrain.jpg,rain\n", encoding="utf-8")
+    external_csv = tmp_path / "external.csv"
+    external_csv.write_text(
+        "image,label,source,sample_weight\n"
+        "rain_extra.jpg,rain,external_weapd,0.5\n",
+        encoding="utf-8",
+    )
+    merged_csv = tmp_path / "merged.csv"
+    audit_json = tmp_path / "audit.json"
+    merge_labeled_with_external_data(
+        train_csv=train_csv,
+        train_dir=None,
+        image_root=official_root,
+        external_csv=external_csv,
+        external_image_root=external_root,
+        output_csv=merged_csv,
+        rejected_csv=tmp_path / "rejected.csv",
+        audit_json=audit_json,
+    )
+
+    rows = list(csv.DictReader(merged_csv.open("r", encoding="utf-8")))
+    rows[1]["sample_weight"] = "1.000000"
+    with merged_csv.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+
+    manifest, _class_to_idx = build_manifest_from_csv(merged_csv)
+    config = AppConfig()
+    config.data.train_csv = merged_csv
+    config.data.external_audit_json = audit_json
+
+    with pytest.raises(ValueError, match="row_digest"):
+        validate_external_merge_audit(manifest, config)
