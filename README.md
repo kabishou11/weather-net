@@ -163,6 +163,29 @@ python3 pseudo_label.py \
   --output pseudo_labels.csv
 ```
 
+从 OOF 估计每类阈值，减少全局阈值让易分类大类吞掉伪标签：
+
+```bash
+python3 pseudo_label.py \
+  --estimate-thresholds-from-oof outputs/convnextv2_384/oof/oof_probabilities.npz \
+  --target-precision 0.95 \
+  --min-class-threshold 0.8 \
+  --fallback-class-threshold 0.99 \
+  --threshold-output outputs/convnextv2_384/per_class_thresholds.json
+```
+
+使用每类阈值和每类上限生成伪标签：
+
+```bash
+python3 pseudo_label.py \
+  --checkpoint outputs/convnextv2_384/convnextv2_tiny.fcmae_ft_in22k_in1k_fold0.pt \
+  --test-dir data/unlabeled \
+  --threshold 0.95 \
+  --per-class-thresholds outputs/convnextv2_384/per_class_thresholds.json \
+  --per-class-max-count configs/pseudo_caps.json \
+  --output pseudo_labels.csv
+```
+
 `pseudo_labels.csv` 字段为 `image,label,confidence`。合并后的训练 CSV 会写出 `image,label,source,confidence,sample_weight`；伪标签权重默认为 `0.3 + 0.7 * confidence`，且会跳过与原始有标注集路径重复的伪标签、拒绝原始类别集合之外的伪标签，避免验证泄漏和污染类别空间。只建议把高置信样本合并进下一轮训练，并保留原始训练集验证划分，避免伪标签污染本地验证分数。
 
 合并原始训练集和伪标签：
