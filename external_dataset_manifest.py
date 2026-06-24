@@ -395,6 +395,7 @@ def main() -> None:
             doi=args.doi,
             allowed_labels=allowed_labels,
             sample_weight=sample_weight,
+            skip_reserved_splits=args.skip_reserved_splits,
         )
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 

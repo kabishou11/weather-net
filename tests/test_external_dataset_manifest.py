@@ -545,3 +545,41 @@ def test_external_manifest_main_builds_road_weather_time_manifest(monkeypatch, t
     main()
 
     assert (tmp_path / "road.csv").read_text(encoding="utf-8").splitlines()[1].endswith(",0.800000")
+
+
+def test_external_manifest_main_skips_reserved_imagefolder_splits(monkeypatch, tmp_path: Path) -> None:
+    import json
+    import sys
+
+    from external_dataset_manifest import main
+
+    root = tmp_path / "vijay"
+    _make_image(root / "dataset" / "cloudy" / "cloudy1.jpg")
+    _make_image(root / "dataset" / "alien_test" / "alien1.jpg")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "external_dataset_manifest.py",
+            "--image-root",
+            str(root / "dataset"),
+            "--output-csv",
+            str(tmp_path / "vijay.csv"),
+            "--summary-json",
+            str(tmp_path / "vijay.json"),
+            "--dataset-name",
+            "external_vijay_multiclass_weather",
+            "--label-map-preset",
+            "vijay_mwd",
+            "--allow-unbounded-labels",
+            "--skip-reserved-splits",
+            "--sample-weight",
+            "0.2",
+        ],
+    )
+
+    main()
+
+    summary = json.loads((tmp_path / "vijay.json").read_text(encoding="utf-8"))
+    assert summary["label_counts"] == {"cloudy": 1}
+    assert summary["skipped_reserved_splits"] == {"alien_test": 1}

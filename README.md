@@ -476,6 +476,15 @@ train:
 - MWD / Multi-class Weather Dataset：当前已解压为 `data/external/mwd_kaggle`，1125 张，类别映射后为 `cloudy 300 / rain 215 / sunny 610`。
 - WEAPD mirror / Weather Image Recognition：当前已解压为 `data/external/weapd_kaggle`，6862 张，Kaggle 标 CC0，类别映射后为 `dew/fog/lightning/rain/rainbow/sandstorm/snow`。其中 `frost/glaze/hail/rime/snow` 合并后 `snow 3486`，语义噪声很重，优先做 embedding guard/异常分析或极低权重补尾类。
 
+当前本地已落地状态：
+
+- `data/external/road_weather_time_kaggle/external_train.csv`：2600 行，只含 Road Weather-Time 的 `train_images`。
+- `data/external/vijay_multiclass_weather_kaggle/external_train.csv`：1500 行，已跳过 `alien_test 30`。
+- `data/external/mwd_kaggle/external_train.csv`：1125 行，已重建为带 `sample_weight` 的新格式。
+- `data/external/weapd_kaggle/external_train.csv`：6862 行，已重建为带 `sample_weight` 的新格式。
+- `data/external/external_train_dedup.csv`：四源按 `Road -> MWD -> Vijay -> WEAPD` 优先级做 SHA256 去重后保留 10749 行。
+- `data/external/external_train_dedup_common5.csv`：从去重全集中过滤 `cloudy/fog/rain/snow/sunny` 五类后保留 8790 行，更适合道路天气常见类 A/B；`dew/lightning/rainbow/sandstorm` 不直接进入常见类训练。
+
 Road Weather-Time JSON manifest：
 
 ```bash
@@ -536,6 +545,26 @@ python3 external_dataset_manifest.py \
 如果官方类别不包含 `dew/lightning/rainbow/sandstorm` 这类标签，`--class-map` 会直接阻止它们进入 manifest；可用自定义 JSON 映射并开启 `--drop-unmapped`，只保留能对齐官方类别的样本。summary 会记录 `dataset_url/license/doi/label_map_sha256/sample_weight`，便于赛前审计数据来源。外部 manifest 会显式写出 `sample_weight`；preflight 看到 `source=external_*` 且缺少该列会失败，避免外部数据被默认等权训练。
 
 外部数据默认不直接等权并入官方训练集。推荐路线：官方 5-fold OOF 强基线 -> OOF hard mining -> 只加 Road Weather-Time `sample_weight 0.3/0.5` 做 3-fold A/B -> 再考虑伪标签 + embedding guard。WEAPD 和 Vijay 优先导出 DINOv2/CLIP/timm embedding 给 `embedding_guard.py` 做语义裁判或异常分析；只有当官方某类明显缺样本时，再用低权重、小比例补充。若比赛规则禁止外部数据，则这些数据只能用于本地鲁棒性分析，不进入最终训练。
+
+合并多个外部 manifest 前必须做内容哈希去重，避免 Vijay/MWD 这类同源数据重复计权：
+
+```bash
+python3 dedupe_external_manifests.py \
+  --manifest data/external/road_weather_time_kaggle/external_train.csv \
+  --image-root data/external/road_weather_time_kaggle/train_dataset \
+  --manifest data/external/mwd_kaggle/external_train.csv \
+  --image-root "data/external/mwd_kaggle/Multi-class Weather Dataset" \
+  --manifest data/external/vijay_multiclass_weather_kaggle/external_train.csv \
+  --image-root data/external/vijay_multiclass_weather_kaggle/dataset \
+  --manifest data/external/weapd_kaggle/external_train.csv \
+  --image-root data/external/weapd_kaggle/dataset \
+  --output-image-root . \
+  --output-csv data/external/external_train_dedup.csv \
+  --rejected-csv data/external/external_train_dedup_rejected.csv \
+  --audit-json data/external/external_train_dedup_audit.json
+```
+
+当前审计结果：输入 12087 行，保留 10749 行，拒绝重复 hash 1338 行；其中 Vijay 被拒绝 1124 行，说明它和 MWD 高度同源，不能与 MWD 等权重复混训。
 
 ## 一次性服务器训练路线
 
