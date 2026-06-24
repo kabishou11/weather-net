@@ -417,6 +417,30 @@ image,label,teacher_cloudy,teacher_rain,teacher_shine,teacher_sunrise
 
 列名必须是 `teacher_{class_name}`，且覆盖 `class_to_idx` 中的每个类别；每行概率必须非负、有限、和为 1。建议 teacher 只来自 OOF 模型、不同架构 ensemble 或独立 teacher，不能用同一 fold 的学生模型预测自己的训练样本，否则本地 F1 会被泄漏污染。
 
+如果已经跑完 K 折并生成 `oof_probabilities.npz`，可直接把 OOF soft label 写回训练 CSV：
+
+```bash
+python3 teacher_from_oof.py \
+  --train-csv data/train.csv \
+  --image-root data/images \
+  --oof outputs/convnextv2_384/oof/oof_probabilities.npz \
+  --max-top1-mismatch-rate 0.25 \
+  --min-mean-true-probability 0.65 \
+  --min-samples-per-class 2 \
+  --output data/train_teacher.csv
+```
+
+该工具会要求 OOF 覆盖每个真实标注样本、`class_names` 顺序与训练 CSV 推断类别顺序一致、概率合法且 OOF 来源全为 `labeled`。建议同时打开 teacher 质量门控：限制 top-1 与真标签冲突率、要求平均 true-class probability 达标，并确认每类有足够 OOF 覆盖。写出后建议先跑 preflight：
+
+```bash
+python3 training_preflight.py \
+  --config configs/convnextv2_384.yaml \
+  --train-csv data/train_teacher.csv \
+  --image-root data/images \
+  --check-image-exists \
+  --check-unique-image-id
+```
+
 配置示例：
 
 ```yaml

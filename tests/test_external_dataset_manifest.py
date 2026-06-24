@@ -22,11 +22,18 @@ def test_external_manifest_maps_mwd_labels(tmp_path: Path) -> None:
         summary_json=tmp_path / "mwd.json",
         dataset_name="mwd",
         label_map=DEFAULT_LABEL_MAPS["mwd"],
+        dataset_url="https://data.mendeley.com/datasets/4drtyfjtfy/1",
+        license_name="CC BY 4.0",
+        doi="10.17632/4drtyfjtfy.1",
     )
 
     assert summary["label_counts"] == {"rain": 1, "sunny": 2}
+    assert summary["dataset_url"] == "https://data.mendeley.com/datasets/4drtyfjtfy/1"
+    assert summary["license"] == "CC BY 4.0"
+    assert summary["doi"] == "10.17632/4drtyfjtfy.1"
+    assert isinstance(summary["label_map_sha256"], str)
     assert (tmp_path / "mwd.csv").read_text(encoding="utf-8").splitlines()[0] == (
-        "image,label,source,original_label"
+        "image,label,source,original_label,dataset_url,license,doi"
     )
 
 

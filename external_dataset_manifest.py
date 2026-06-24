@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 from collections import Counter
 from pathlib import Path
@@ -71,10 +72,17 @@ def build_external_manifest(
     dataset_name: str,
     label_map: dict[str, str],
     drop_unmapped: bool = False,
+    dataset_url: str = "",
+    license_name: str = "",
+    doi: str = "",
 ) -> dict[str, object]:
     image_root = image_root.expanduser().resolve()
-    rows: list[tuple[str, str, str, str]] = []
+    rows: list[tuple[str, str, str, str, str, str, str]] = []
     skipped: Counter[str] = Counter()
+    normalized_label_map = {str(key): str(value) for key, value in sorted(label_map.items())}
+    label_map_sha256 = hashlib.sha256(
+        json.dumps(normalized_label_map, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
 
     for path in sorted(image_root.rglob("*")):
         if not path.is_file() or not is_image_file(path):
@@ -87,7 +95,7 @@ def build_external_manifest(
             skipped[original_label] += 1
             continue
         image = relative_path.as_posix()
-        rows.append((image, mapped_label, dataset_name, original_label))
+        rows.append((image, mapped_label, dataset_name, original_label, dataset_url, license_name, doi))
 
     if not rows:
         raise ValueError(f"No image files found under {image_root}")
@@ -95,19 +103,25 @@ def build_external_manifest(
     output_csv.parent.mkdir(parents=True, exist_ok=True)
     with output_csv.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle)
-        writer.writerow(["image", "label", "source", "original_label"])
+        writer.writerow(["image", "label", "source", "original_label", "dataset_url", "license", "doi"])
         writer.writerows(rows)
 
-    counts = Counter(label for _image, label, _source, _original_label in rows)
-    original_counts = Counter(original_label for _image, _label, _source, original_label in rows)
+    counts = Counter(label for _image, label, _source, _original_label, _url, _license, _doi in rows)
+    original_counts = Counter(
+        original_label for _image, _label, _source, original_label, _url, _license, _doi in rows
+    )
     summary: dict[str, object] = {
         "dataset": dataset_name,
+        "dataset_url": dataset_url,
+        "license": license_name,
+        "doi": doi,
         "image_root": str(image_root),
         "output_csv": str(output_csv),
         "total": len(rows),
         "label_counts": dict(sorted(counts.items())),
         "original_label_counts": dict(sorted(original_counts.items())),
         "skipped_unmapped": dict(sorted(skipped.items())),
+        "label_map_sha256": label_map_sha256,
     }
     summary_json.parent.mkdir(parents=True, exist_ok=True)
     summary_json.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -120,6 +134,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-csv", type=Path, required=True)
     parser.add_argument("--summary-json", type=Path, required=True)
     parser.add_argument("--dataset-name", required=True)
+    parser.add_argument("--dataset-url", default="")
+    parser.add_argument("--license", dest="license_name", default="")
+    parser.add_argument("--doi", default="")
     parser.add_argument("--label-map-preset", choices=sorted(DEFAULT_LABEL_MAPS), default=None)
     parser.add_argument("--label-map-json", type=Path, default=None)
     parser.add_argument("--drop-unmapped", action="store_true")
@@ -136,6 +153,9 @@ def main() -> None:
         dataset_name=args.dataset_name,
         label_map=label_map,
         drop_unmapped=args.drop_unmapped,
+        dataset_url=args.dataset_url,
+        license_name=args.license_name,
+        doi=args.doi,
     )
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 
