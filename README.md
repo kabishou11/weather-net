@@ -137,6 +137,20 @@ python3 oof_decide.py \
 
 `--bootstrap-rounds` 会对 OOF 样本做分层有放回重采样，评估 per-class bias 相对 temperature-only 结果的稳定增益；若 `delta_q05_macro_f1` 低于 `--bootstrap-min-delta-q05`，会自动回退 bias，避免把 OOF 偶然性写进提交参数。这个步骤只影响决策参数搜索，不增加线上推理成本；不传 bootstrap 参数时保持旧行为，不启用门控。
 
+## Model Soup
+
+同架构 checkpoint 可以做权重平均，得到单 checkpoint 推理包：
+
+```bash
+python3 soup_checkpoints.py \
+  --checkpoints outputs/seed1/convnextv2.pt outputs/seed2/convnextv2.pt \
+  --oof outputs/seed1/oof/oof_probabilities.npz outputs/seed2/oof/oof_probabilities.npz \
+  --min-delta 0.0 \
+  --output outputs/soup/convnextv2_oof_gated_soup.pt
+```
+
+传入 `--oof` 时会先用 OOF logits 做 greedy 权重搜索，只保留不低于最佳单 checkpoint macro F1 的 soup 权重，再平均模型参数。这个 OOF 分数用于 gate logits 权重，不等价于 soup checkpoint 的最终验证分数；生成后建议再用 `validate.py` 跑一次本地验证。这个步骤适合同一架构、同类别映射、同输入尺寸的多 seed 或 late checkpoint；不要跨架构 soup，跨架构请继续用 logits ensemble 或 OOF 决策层。
+
 ## 伪标签
 
 对未标注图片生成高置信伪标签：
