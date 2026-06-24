@@ -149,6 +149,24 @@ python3 oof_decide.py \
 
 `--bootstrap-rounds` 会对 OOF 样本做分层有放回重采样，评估 per-class bias 相对 temperature-only 结果的稳定增益；若 `delta_q05_macro_f1` 低于 `--bootstrap-min-delta-q05`，会自动回退 bias，避免把 OOF 偶然性写进提交参数。这个步骤只影响决策参数搜索，不增加线上推理成本；不传 bootstrap 参数时保持旧行为，不启用门控。
 
+基于 OOF 生成下一轮训练的 hard-sample 权重：
+
+```bash
+python3 hard_mining.py \
+  --train-csv data/train.csv \
+  --oof-csv outputs/convnextv2_384/oof/oof_predictions.csv \
+  --error-boost 1.0 \
+  --low-margin-boost 0.5 \
+  --high-loss-boost 0.5 \
+  --low-margin-threshold 0.1 \
+  --high-loss-quantile 0.75 \
+  --max-weight 2.5 \
+  --output data/train_hard_weighted.csv \
+  --hard-output outputs/convnextv2_384/hard_samples.csv
+```
+
+`hard_mining.py` 只给真实标注样本写回 `sample_weight`，不会用 OOF 结果改伪标签行；`hard_samples.csv` 可用于检查错分、低 margin 和高 loss 样本。该步骤适合在强单模 OOF 后做第二轮 fine-tune，目标是把训练容量集中到拖 macro F1 的混淆类和边界样本上，不增加推理成本。若已生成 `merged_train.csv`，也可以把它作为 `--train-csv` 输入，脚本会保留其中伪标签行的原始权重。
+
 ## Model Soup
 
 同架构 checkpoint 可以做权重平均，得到单 checkpoint 推理包：

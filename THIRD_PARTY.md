@@ -21,6 +21,7 @@
 - ConvNeXt V2：参考 Woo et al., "ConvNeXt V2: Co-designing and Scaling ConvNets with Masked Autoencoders"，通过 `timm` 使用公开预训练骨干，不复制论文或第三方实现代码。
 - Model Soups：参考 Wortsman et al., "Model soups: averaging weights of multiple fine-tuned models improves accuracy without increasing inference time"，本项目增加 OOF-gated greedy 权重搜索，只对同架构 checkpoint 做参数平均。
 - Bootstrap resampling：参考 Efron 的 bootstrap 重采样思想，用于 OOF 决策参数稳定性评估；本项目只用它过滤不稳定的 per-class bias，不引入额外训练数据。
+- Online Hard Example Mining / hard-sample reweighting：参考 Shrivastava et al. 的难样本挖掘思想；本项目用 OOF 错分、低 margin、高 loss 生成下一轮训练的 `sample_weight`，不改变线上推理结构。
 - FixMatch / Noisy Student：参考 Sohn et al. 与 Xie et al. 的高置信伪标签思路；本项目只做 OOF 估计的 class-aware 阈值和每类配额，不使用隐藏测试标签。
 - AugMix：参考 Hendrycks et al., "AugMix: A Simple Data Processing Method to Improve Robustness and Uncertainty"，本项目实现天气增强三视图和 JSD consistency 训练正则，不复制官方实现代码。
 - CLIP / DINOv2：参考 Radford et al. 与 Oquab et al. 的通用视觉语义特征思想；本项目只消费离线导出的 image embedding 做伪标签语义原型裁判，不复制模型实现，不把额外大模型放入线上推理。
