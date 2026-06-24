@@ -57,6 +57,17 @@ python3 train.py \
 
 `convnextv2_384.yaml` 面向 24G 4090 设计，主线是 ConvNeXtV2 预训练骨干、384 输入、WeatherAugMix、EMA、MixUp/CutMix，以及 `class_balanced_focal` 长尾损失。这个组合对齐 macro F1：少数天气类会获得更高训练权重，focal 项会让模型更关注难样本。不要只看单次验证分数，最终以 5-fold OOF macro F1、每类 F1 和混淆矩阵判断是否保留。
 
+长尾先验校正对照：
+
+```bash
+python3 train.py \
+  --train-csv data/train.csv \
+  --image-root data/images \
+  --config configs/convnextv2_384_balanced_softmax.yaml
+```
+
+`convnextv2_384_balanced_softmax.yaml` 使用 Balanced Softmax，在训练 loss 内按当前 fold 的训练集类别计数调整 logits。它适合天气类别明显不均衡、线上评分看 macro F1 的场景；默认 `sampler_mode: auto` 不再额外做类均衡采样，避免“先验校正 + 重采样”双重放大尾类。建议先跑 1 fold 或 3 fold 和 `class_balanced_focal` 对比，若少数类 F1 上升且大类 precision 没崩，再进入 5 fold/soup。
+
 鲁棒性增强路线：
 
 ```bash

@@ -88,6 +88,21 @@ def test_load_config_accepts_sample_weight_usage(tmp_path: Path) -> None:
     assert config.train.sample_weight_usage == "sampler"
 
 
+def test_load_config_accepts_balanced_softmax_loss(tmp_path: Path) -> None:
+    from src.weather_net.config import load_config
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "train:\n"
+        "  loss_name: balanced_softmax\n",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert config.train.loss_name == "balanced_softmax"
+
+
 def test_load_config_accepts_inference_amp_option(tmp_path: Path) -> None:
     from src.weather_net.config import load_config
 
@@ -200,6 +215,18 @@ def test_convnextv2_384_config_is_parseable() -> None:
     assert config.model.image_size == 384
     assert config.data.folds == 5
     assert config.train.loss_name == "class_balanced_focal"
+
+
+def test_convnextv2_384_balanced_softmax_config_is_parseable() -> None:
+    from src.weather_net.config import load_config
+
+    config = load_config(Path("configs/convnextv2_384_balanced_softmax.yaml"))
+
+    assert config.model.image_size == 384
+    assert config.data.folds == 5
+    assert config.train.loss_name == "balanced_softmax"
+    assert config.train.sampler_mode == "auto"
+    assert config.train.focal_gamma == 0.0
 
 
 def test_convnextv2_384_augmix_jsd_config_is_parseable() -> None:

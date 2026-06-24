@@ -119,6 +119,7 @@ def test_make_sampler_auto_disables_weighted_sampling_for_class_balanced_loss(tm
     ]
 
     assert make_sampler(rows, sampler_mode="auto", loss_name="class_balanced_focal") is None
+    assert make_sampler(rows, sampler_mode="auto", loss_name="balanced_softmax") is None
     assert make_sampler(rows, sampler_mode="weighted", loss_name="class_balanced_focal") is not None
 
 
@@ -277,6 +278,31 @@ def test_weighted_soft_cross_entropy_normalizes_embedded_target_weights() -> Non
     assert torch.isclose(loss, torch.tensor(0.6931472), atol=1e-6)
 
 
+def test_balanced_softmax_cross_entropy_adjusts_logits_by_class_counts() -> None:
+    from src.weather_net.training import balanced_softmax_cross_entropy
+
+    logits = torch.tensor([[0.0, 0.0]])
+    soft_targets = torch.tensor([[1.0, 0.0]])
+    class_counts = torch.tensor([9.0, 1.0])
+
+    loss = balanced_softmax_cross_entropy(logits, soft_targets, class_counts=class_counts)
+    expected = torch.nn.functional.cross_entropy(
+        logits + class_counts.log().unsqueeze(0),
+        torch.tensor([0]),
+    )
+
+    assert torch.isclose(loss, expected, atol=1e-7)
+    assert expected < torch.tensor(0.2)
+
+
+def test_compute_class_counts_for_balanced_softmax() -> None:
+    from src.weather_net.training import compute_class_counts
+
+    counts = compute_class_counts(labels=[0, 0, 0, 1], num_classes=3)
+
+    assert torch.equal(counts, torch.tensor([3.0, 1.0, 1.0]))
+
+
 def test_augmix_jsd_loss_is_zero_for_identical_predictions() -> None:
     from src.weather_net.training import augmix_jsd_loss
 
@@ -397,6 +423,41 @@ def test_train_one_epoch_consumes_augmix_jsd_batches() -> None:
     )
 
     assert loss > 0
+
+
+def test_train_one_epoch_requires_class_counts_for_balanced_softmax() -> None:
+    import pytest
+    from torch import nn
+    from torch.utils.data import DataLoader, TensorDataset
+
+    from src.weather_net.training import train_one_epoch
+
+    loader = DataLoader(
+        TensorDataset(
+            torch.randn(2, 3, 4, 4),
+            torch.tensor([0, 1]),
+            torch.ones(2),
+        ),
+        batch_size=2,
+    )
+    model = nn.Sequential(nn.Flatten(), nn.Linear(3 * 4 * 4, 2))
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    scaler = torch.amp.GradScaler("cuda", enabled=False)
+
+    with pytest.raises(ValueError, match="class_counts"):
+        train_one_epoch(
+            model,
+            loader,
+            optimizer,
+            scaler,
+            device="cpu",
+            num_classes=2,
+            label_smoothing=0.0,
+            mixup_alpha=0.0,
+            cutmix_alpha=0.0,
+            amp=False,
+            loss_name="balanced_softmax",
+        )
 
 
 def test_train_one_epoch_rejects_jsd_weight_for_single_view_batches() -> None:

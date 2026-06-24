@@ -112,8 +112,11 @@ def load_config(path: Path | None) -> AppConfig:
 
 
 def _validate_config(config: AppConfig) -> None:
-    if config.train.loss_name not in {"ce", "focal", "class_balanced", "class_balanced_focal"}:
-        raise ValueError("train.loss_name must be one of: ce, focal, class_balanced, class_balanced_focal")
+    supported_losses = {"ce", "focal", "class_balanced", "class_balanced_focal", "balanced_softmax"}
+    if config.train.loss_name not in supported_losses:
+        raise ValueError(
+            "train.loss_name must be one of: ce, focal, class_balanced, class_balanced_focal, balanced_softmax"
+        )
     if config.train.focal_gamma < 0:
         raise ValueError("train.focal_gamma must be non-negative")
     if not 0 <= config.train.class_balanced_beta < 1:

@@ -96,7 +96,7 @@ def make_sampler(
         if min(weights) == max(weights):
             return None
         return WeightedRandomSampler(weights=weights, num_samples=len(weights), replacement=True)
-    if sampler_mode == "auto" and "class_balanced" in loss_name:
+    if sampler_mode == "auto" and ("class_balanced" in loss_name or loss_name == "balanced_softmax"):
         return None
     labels = _labels(rows)
     counts = np.bincount(labels)
@@ -320,8 +320,8 @@ def compute_class_weights(
     loss_name: str,
     beta: float = 0.999,
 ) -> torch.Tensor | None:
-    if loss_name not in {"ce", "focal", "class_balanced", "class_balanced_focal"}:
-        raise ValueError("loss_name must be one of: ce, focal, class_balanced, class_balanced_focal")
+    if loss_name not in {"ce", "focal", "class_balanced", "class_balanced_focal", "balanced_softmax"}:
+        raise ValueError("loss_name must be one of: ce, focal, class_balanced, class_balanced_focal, balanced_softmax")
     if "class_balanced" not in loss_name:
         return None
     if not 0 <= beta < 1:
@@ -331,6 +331,11 @@ def compute_class_weights(
     effective_num = 1.0 - torch.pow(torch.tensor(beta, dtype=torch.float32), counts)
     weights = (1.0 - beta) / effective_num.clamp_min(1e-12)
     return weights / weights.mean().clamp_min(1e-12)
+
+
+def compute_class_counts(labels: Sequence[int], num_classes: int) -> torch.Tensor:
+    counts = torch.bincount(torch.tensor(labels, dtype=torch.long), minlength=num_classes).float()
+    return counts.clamp_min(1.0)
 
 
 def weighted_soft_cross_entropy(
@@ -364,6 +369,27 @@ def weighted_soft_cross_entropy(
         normalizer = normalizer * sample_weights
         return (losses * sample_weights).sum() / normalizer.sum().clamp_min(1e-8)
     return losses.sum() / normalizer.sum().clamp_min(1e-8)
+
+
+def balanced_softmax_cross_entropy(
+    logits: torch.Tensor,
+    soft_targets: torch.Tensor,
+    class_counts: torch.Tensor,
+    sample_weights: torch.Tensor | None = None,
+    focal_gamma: float = 0.0,
+    reduction: str = "mean",
+) -> torch.Tensor:
+    if class_counts.ndim != 1 or class_counts.numel() != logits.shape[1]:
+        raise ValueError("class_counts must be a 1D tensor with one value per class")
+    adjusted_logits = logits + class_counts.to(logits.device, dtype=logits.dtype).clamp_min(1.0).log().unsqueeze(0)
+    return weighted_soft_cross_entropy(
+        adjusted_logits,
+        soft_targets,
+        sample_weights=sample_weights,
+        class_weights=None,
+        focal_gamma=focal_gamma,
+        reduction=reduction,
+    )
 
 
 def split_augmix_jsd_batch(images) -> tuple[torch.Tensor, list[torch.Tensor]]:
@@ -419,6 +445,7 @@ def train_one_epoch(
     loss_name: str = "ce",
     focal_gamma: float = 0.0,
     class_weights: torch.Tensor | None = None,
+    class_counts: torch.Tensor | None = None,
     model_ema: ModelEma | None = None,
     jsd_weight: float = 0.0,
 ) -> float:
@@ -427,10 +454,14 @@ def train_one_epoch(
     total_items = 0
     use_amp = amp and device == "cuda"
     class_weights = None if class_weights is None else class_weights.to(device)
+    class_counts = None if class_counts is None else class_counts.to(device)
     use_focal = loss_name in {"focal", "class_balanced_focal"}
+    use_balanced_softmax = loss_name == "balanced_softmax"
 
     if jsd_weight < 0:
         raise ValueError("jsd_weight must be non-negative")
+    if use_balanced_softmax and class_counts is None:
+        raise ValueError("class_counts is required when loss_name is balanced_softmax")
 
     for images, targets, sample_weights in loader:
         images, augmix_views = split_augmix_jsd_batch(images)
@@ -456,24 +487,44 @@ def train_one_epoch(
                 soft_targets = _apply_label_smoothing(soft_targets, label_smoothing)
                 weighted_targets = _apply_weighted_label_smoothing(weighted_targets, label_smoothing)
                 logits = model(images)
-                loss = weighted_soft_cross_entropy(
-                    logits,
-                    weighted_targets,
-                    sample_weights=None,
-                    class_weights=class_weights,
-                    focal_gamma=focal_gamma if use_focal else 0.0,
-                )
+                if use_balanced_softmax:
+                    assert class_counts is not None
+                    loss = balanced_softmax_cross_entropy(
+                        logits,
+                        weighted_targets,
+                        class_counts=class_counts,
+                        sample_weights=None,
+                        focal_gamma=0.0,
+                    )
+                else:
+                    loss = weighted_soft_cross_entropy(
+                        logits,
+                        weighted_targets,
+                        sample_weights=None,
+                        class_weights=class_weights,
+                        focal_gamma=focal_gamma if use_focal else 0.0,
+                    )
             else:
                 logits = model(images)
                 soft_targets = _one_hot_targets(targets, num_classes=num_classes)
                 soft_targets = _apply_label_smoothing(soft_targets, label_smoothing)
-                loss = weighted_soft_cross_entropy(
-                    logits,
-                    soft_targets,
-                    sample_weights=sample_weights,
-                    class_weights=class_weights,
-                    focal_gamma=focal_gamma if use_focal else 0.0,
-                )
+                if use_balanced_softmax:
+                    assert class_counts is not None
+                    loss = balanced_softmax_cross_entropy(
+                        logits,
+                        soft_targets,
+                        class_counts=class_counts,
+                        sample_weights=sample_weights,
+                        focal_gamma=0.0,
+                    )
+                else:
+                    loss = weighted_soft_cross_entropy(
+                        logits,
+                        soft_targets,
+                        sample_weights=sample_weights,
+                        class_weights=class_weights,
+                        focal_gamma=focal_gamma if use_focal else 0.0,
+                    )
             if augmix_views:
                 if jsd_weight <= 0:
                     raise ValueError("jsd_weight must be positive for augmix_jsd batches")
@@ -696,6 +747,11 @@ def train_config(config: AppConfig, device_request: str = "auto") -> list[Path]:
             loss_name=config.train.loss_name,
             beta=config.train.class_balanced_beta,
         )
+        class_counts = (
+            compute_class_counts(_labels(train_rows), num_classes=len(class_names))
+            if config.train.loss_name == "balanced_softmax"
+            else None
+        )
         optimizer = torch.optim.AdamW(
             model.parameters(),
             lr=config.train.lr,
@@ -728,6 +784,7 @@ def train_config(config: AppConfig, device_request: str = "auto") -> list[Path]:
                 loss_name=config.train.loss_name,
                 focal_gamma=config.train.focal_gamma,
                 class_weights=class_weights,
+                class_counts=class_counts,
                 model_ema=model_ema,
                 jsd_weight=config.train.jsd_weight,
             )
