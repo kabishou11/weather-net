@@ -200,12 +200,28 @@ python3 pseudo_label.py \
 
 `pseudo_labels.csv` 字段为 `image,label,confidence`。合并后的训练 CSV 会写出 `image,label,source,confidence,sample_weight`；伪标签权重默认为 `0.3 + 0.7 * confidence`，且会跳过与原始有标注集路径重复的伪标签、拒绝原始类别集合之外的伪标签，避免验证泄漏和污染类别空间。只建议把高置信样本合并进下一轮训练，并保留原始训练集验证划分，避免伪标签污染本地验证分数。
 
+可选：用 CLIP/DINOv2/timm 等离线导出的 image embedding 做语义原型裁判，过滤“分类模型高置信但视觉语义不像该类”的伪标签：
+
+```bash
+python3 embedding_guard.py \
+  --train-csv data/train.csv \
+  --image-root data/images \
+  --pseudo-csv pseudo_labels.csv \
+  --embeddings outputs/embeddings/clip_or_dinov2_embeddings.npz \
+  --min-similarity 0.8 \
+  --min-margin 0.1 \
+  --output pseudo_labels_filtered.csv \
+  --rejected-output pseudo_labels_rejected.csv
+```
+
+`embeddings.npz` 需要包含 `image_id` 和 `embedding` 两个数组；`image_id` 必须覆盖训练 CSV/ImageFolder 的原始 image id 以及伪标签 CSV 的 `image` 列。该步骤只清洗伪标签，不进入线上推理；建议先审查 `pseudo_labels_rejected.csv`，确认过滤掉的是跨类污染或异常图，再把 `pseudo_labels_filtered.csv` 交给合并脚本。
+
 合并原始训练集和伪标签：
 
 ```bash
 python3 merge_pseudo_labels.py \
   --train-dir data/train \
-  --pseudo-csv pseudo_labels.csv \
+  --pseudo-csv pseudo_labels_filtered.csv \
   --pseudo-image-root data/unlabeled \
   --min-confidence 0.95 \
   --output merged_train.csv
