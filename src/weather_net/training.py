@@ -21,6 +21,7 @@ from .data import (
     build_manifest_from_csv,
     build_manifest_from_image_folder,
     idx_to_class,
+    is_validation_source,
     iter_kfold_splits,
     save_class_mapping,
     split_train_val,
@@ -832,8 +833,8 @@ def collect_oof_predictions(
     loader: DataLoader | None = None,
 ) -> list[OofRecord]:
     model.eval()
-    if any(row.source == "pseudo" for row in rows):
-        raise ValueError("Pseudo rows must not be used as OOF validation rows")
+    if any(not is_validation_source(row) for row in rows):
+        raise ValueError("OOF validation rows must come from labeled sources")
     if loader is None:
         if image_size is None:
             raise ValueError("image_size is required when loader is not provided")

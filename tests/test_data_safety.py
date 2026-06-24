@@ -102,6 +102,24 @@ def test_split_train_val_never_places_pseudo_rows_in_validation(tmp_path: Path) 
     assert {row.path.name for row in train_rows} >= {"rain2.jpg", "sunny2.jpg"}
 
 
+def test_split_train_val_never_places_external_rows_in_validation(tmp_path: Path) -> None:
+    from src.weather_net.data import ManifestRow, split_train_val
+
+    rows = [
+        ManifestRow(path=tmp_path / "rain0.jpg", label=0, label_name="rain", source="labeled"),
+        ManifestRow(path=tmp_path / "rain1.jpg", label=0, label_name="rain", source="labeled"),
+        ManifestRow(path=tmp_path / "sunny0.jpg", label=1, label_name="sunny", source="labeled"),
+        ManifestRow(path=tmp_path / "sunny1.jpg", label=1, label_name="sunny", source="labeled"),
+        ManifestRow(path=tmp_path / "external" / "rain2.jpg", label=0, label_name="rain", source="external_weapd"),
+        ManifestRow(path=tmp_path / "external" / "sunny2.jpg", label=1, label_name="sunny", source="external_mwd"),
+    ]
+
+    train_rows, val_rows = split_train_val(rows, val_fraction=0.5, seed=0)
+
+    assert all(row.source == "labeled" for row in val_rows)
+    assert {row.path.name for row in train_rows} >= {"rain2.jpg", "sunny2.jpg"}
+
+
 def test_iter_kfold_splits_reduces_folds_for_smallest_class(tmp_path: Path) -> None:
     from src.weather_net.data import ManifestRow, iter_kfold_splits
 
@@ -139,4 +157,24 @@ def test_iter_kfold_splits_never_places_pseudo_rows_in_validation(tmp_path: Path
     assert len(splits) == 2
     for _, train_rows, val_rows in splits:
         assert all(row.source != "pseudo" for row in val_rows)
+        assert {row.path.name for row in train_rows} >= {"rain2.jpg", "sunny2.jpg"}
+
+
+def test_iter_kfold_splits_never_places_external_rows_in_validation(tmp_path: Path) -> None:
+    from src.weather_net.data import ManifestRow, iter_kfold_splits
+
+    rows = [
+        ManifestRow(path=tmp_path / "rain0.jpg", label=0, label_name="rain", source="labeled"),
+        ManifestRow(path=tmp_path / "rain1.jpg", label=0, label_name="rain", source="labeled"),
+        ManifestRow(path=tmp_path / "sunny0.jpg", label=1, label_name="sunny", source="labeled"),
+        ManifestRow(path=tmp_path / "sunny1.jpg", label=1, label_name="sunny", source="labeled"),
+        ManifestRow(path=tmp_path / "external" / "rain2.jpg", label=0, label_name="rain", source="external_weapd"),
+        ManifestRow(path=tmp_path / "external" / "sunny2.jpg", label=1, label_name="sunny", source="external_mwd"),
+    ]
+
+    splits = list(iter_kfold_splits(rows, folds=2, seed=3))
+
+    assert len(splits) == 2
+    for _, train_rows, val_rows in splits:
+        assert all(row.source == "labeled" for row in val_rows)
         assert {row.path.name for row in train_rows} >= {"rain2.jpg", "sunny2.jpg"}

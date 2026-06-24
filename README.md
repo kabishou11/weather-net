@@ -470,6 +470,58 @@ python3 external_dataset_manifest.py \
 
 外部数据默认不直接等权并入官方训练集。推荐用法是：先按官方类别过滤，再加 `source=external` 和低 `sample_weight`，或只导出 DINOv2/CLIP/timm embedding 给 `embedding_guard.py` 做伪标签语义裁判。若比赛规则禁止外部数据，则这些数据只能用于本地鲁棒性分析，不进入最终训练。
 
+## 服务器训练前 preflight
+
+正式上 4090/服务器前先跑训练门控，避免一次长训练被 CSV、类别映射、外部数据、teacher 列或推理预算问题毁掉：
+
+```bash
+python3 training_preflight.py \
+  --config configs/convnextv2_384.yaml \
+  --train-csv data/train.csv \
+  --image-root data/images \
+  --class-map outputs/convnextv2_384/class_to_idx.json \
+  --check-image-exists \
+  --check-unique-image-id \
+  --check-unique-realpath \
+  --min-images-per-class 2 \
+  --output outputs/preflight_train.json
+```
+
+如果训练 CSV 包含 `source=external` 或 `external_*`，必须显式声明规则允许外部公开数据：
+
+```bash
+python3 training_preflight.py \
+  --config configs/convnextv2_384.yaml \
+  --train-csv data/train_with_external.csv \
+  --image-root data/images \
+  --allow-external-data
+```
+
+如果训练 CSV 包含 `source=pseudo`，建议把伪标签置信度和数量比例设成硬门槛：
+
+```bash
+python3 training_preflight.py \
+  --config configs/convnextv2_384.yaml \
+  --train-csv data/merged_train.csv \
+  --image-root data/images \
+  --pseudo-min-confidence 0.95 \
+  --pseudo-max-ratio 0.5
+```
+
+如果已经有 `infer.py` 生成的 `.stats.json`，可把推理时间也纳入同一个 gate：
+
+```bash
+python3 training_preflight.py \
+  --config configs/convnextv2_384.yaml \
+  --train-csv data/train.csv \
+  --image-root data/images \
+  --inference-stats outputs/submission.stats.json \
+  --max-seconds-per-image 0.05 \
+  --max-checkpoints 1
+```
+
+当 `train.distillation_alpha > 0` 时，preflight 会要求每一行都有完整 `teacher_{class_name}` 概率列，并要求 teacher 训练 CSV 只包含真实标注行。`--train-csv` 和 `--train-dir` 不能同时设置；当外部数据未显式允许、伪标签低于门槛、某类样本低于门槛、推理 stats 超预算或 TTA 未被允许时，会直接失败。
+
 ## 四天冲分顺序
 
 1. 先用 `convnext_tiny` 跑通单模型，保存 `class_to_idx.json` 和 best checkpoint。

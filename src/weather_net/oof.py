@@ -65,8 +65,11 @@ def _validate_records(records: Sequence[OofRecord], class_names: Sequence[str]) 
         raise ValueError(f"Duplicate OOF image ids are not safe: {preview}")
     expected_classes = len(class_names)
     for record in records:
-        if record.source == "pseudo":
-            raise ValueError(f"Pseudo rows must not be written as OOF validation records: {record.image_id}")
+        if record.source != "labeled":
+            raise ValueError(
+                "OOF validation records must come from labeled rows: "
+                f"{record.image_id} source={record.source}"
+            )
         if len(record.logits) != expected_classes:
             raise ValueError("Each OOF record must have one logit per class")
         if record.true_idx < 0 or record.true_idx >= expected_classes:

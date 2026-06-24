@@ -93,6 +93,33 @@ def test_oof_artifacts_reject_duplicate_image_ids(tmp_path: Path) -> None:
         )
 
 
+def test_oof_artifacts_reject_non_labeled_validation_sources(tmp_path: Path) -> None:
+    from src.weather_net.oof import OofRecord, write_oof_artifacts
+
+    records = [
+        OofRecord(
+            image_id="external.jpg",
+            image_path="/data/external.jpg",
+            fold=0,
+            source="external_weapd",
+            true_idx=0,
+            true_label="rain",
+            logits=[2.0, 0.0],
+            checkpoint="fold0.pt",
+            model_name="tiny",
+        ),
+    ]
+
+    with pytest.raises(ValueError, match="OOF validation records must come from labeled rows"):
+        write_oof_artifacts(
+            output_dir=tmp_path / "oof",
+            records=records,
+            class_names=["rain", "sunny"],
+            class_to_idx={"rain": 0, "sunny": 1},
+            metadata={},
+        )
+
+
 def test_oof_csv_columns_include_class_indices_to_avoid_sanitized_name_collisions(tmp_path: Path) -> None:
     from src.weather_net.oof import OofRecord, write_oof_artifacts
 

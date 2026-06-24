@@ -228,6 +228,10 @@ def idx_to_class(class_to_idx: dict[str, int]) -> list[str]:
     return [name for name, _ in sorted(class_to_idx.items(), key=lambda item: item[1])]
 
 
+def is_validation_source(row: ManifestRow) -> bool:
+    return row.source == "labeled"
+
+
 def split_train_val(
     rows: Sequence[ManifestRow],
     val_fraction: float,
@@ -243,7 +247,7 @@ def split_train_val(
     for row in rows:
         if row.label is None:
             raise ValueError("Cannot split unlabeled rows")
-        if row.source == "pseudo":
+        if not is_validation_source(row):
             forced_train_rows.append(row)
             continue
         by_label.setdefault(row.label, []).append(row)
@@ -316,8 +320,10 @@ def iter_kfold_splits(
     if folds < 2:
         raise ValueError("folds must be at least 2")
 
-    labeled_rows = [row for row in rows if row.source != "pseudo"]
-    pseudo_rows = [row for row in rows if row.source == "pseudo"]
+    validation_rows = [row for row in rows if is_validation_source(row)]
+    forced_train_rows = [row for row in rows if not is_validation_source(row)]
+    labeled_rows = validation_rows
+    pseudo_rows = forced_train_rows
     effective_folds = _effective_kfold_count(labeled_rows, folds)
     if effective_folds < 2:
         train_rows, val_rows = split_train_val(rows, val_fraction=1.0 / folds, seed=seed)
