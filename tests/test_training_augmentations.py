@@ -122,6 +122,111 @@ def test_make_sampler_auto_disables_weighted_sampling_for_class_balanced_loss(tm
     assert make_sampler(rows, sampler_mode="weighted", loss_name="class_balanced_focal") is not None
 
 
+def test_make_sampler_sample_weighted_uses_manifest_sample_weights(tmp_path: Path) -> None:
+    from src.weather_net.data import ManifestRow
+    from src.weather_net.training import make_sampler
+
+    rows = [
+        ManifestRow(path=tmp_path / "easy.jpg", label=0, sample_weight=1.0),
+        ManifestRow(path=tmp_path / "hard.jpg", label=0, sample_weight=2.5),
+        ManifestRow(path=tmp_path / "tail.jpg", label=1, sample_weight=1.0),
+    ]
+
+    sampler = make_sampler(rows, sampler_mode="sample_weighted", loss_name="class_balanced_focal")
+
+    assert sampler is not None
+    assert list(sampler.weights.tolist()) == [1.0, 2.5, 1.0]
+
+
+def test_make_sampler_sample_weighted_rejects_invalid_sample_weights(tmp_path: Path) -> None:
+    import pytest
+
+    from src.weather_net.data import ManifestRow
+    from src.weather_net.training import make_sampler
+
+    rows = [
+        ManifestRow(path=tmp_path / "a.jpg", label=0, sample_weight=1.0),
+        ManifestRow(path=tmp_path / "b.jpg", label=1, sample_weight=0.0),
+    ]
+
+    with pytest.raises(ValueError, match="sample_weight"):
+        make_sampler(rows, sampler_mode="sample_weighted")
+
+
+def test_make_loaders_can_use_sample_weights_for_sampler_only(tmp_path: Path) -> None:
+    from src.weather_net.data import ManifestRow
+    from src.weather_net.training import make_loaders
+
+    rows = [
+        ManifestRow(path=tmp_path / "easy.jpg", label=0, sample_weight=1.0),
+        ManifestRow(path=tmp_path / "hard.jpg", label=1, sample_weight=2.5),
+    ]
+
+    train_loader, _val_loader = make_loaders(
+        train_rows=rows,
+        val_rows=rows,
+        image_size=8,
+        batch_size=2,
+        num_workers=0,
+        sampler_mode="sample_weighted",
+        sample_weight_usage="sampler",
+        loss_name="class_balanced_focal",
+    )
+
+    assert train_loader.sampler is not None
+    assert list(train_loader.sampler.weights.tolist()) == [1.0, 2.5]
+    assert train_loader.dataset.rows[1].sample_weight == 1.0
+
+
+def test_make_loaders_sample_weight_usage_loss_disables_sample_weight_sampler(tmp_path: Path) -> None:
+    from src.weather_net.data import ManifestRow
+    from src.weather_net.training import make_loaders
+
+    rows = [
+        ManifestRow(path=tmp_path / "easy.jpg", label=0, sample_weight=1.0),
+        ManifestRow(path=tmp_path / "hard.jpg", label=1, sample_weight=2.5),
+    ]
+
+    train_loader, _val_loader = make_loaders(
+        train_rows=rows,
+        val_rows=rows,
+        image_size=8,
+        batch_size=2,
+        num_workers=0,
+        sampler_mode="sample_weighted",
+        sample_weight_usage="loss",
+        loss_name="class_balanced_focal",
+    )
+
+    assert train_loader.batch_sampler.sampler.__class__.__name__ == "RandomSampler"
+    assert train_loader.dataset.rows[1].sample_weight == 2.5
+
+
+def test_make_loaders_sample_weight_usage_both_keeps_sampler_and_loss_weights(tmp_path: Path) -> None:
+    from src.weather_net.data import ManifestRow
+    from src.weather_net.training import make_loaders
+
+    rows = [
+        ManifestRow(path=tmp_path / "easy.jpg", label=0, sample_weight=1.0),
+        ManifestRow(path=tmp_path / "hard.jpg", label=1, sample_weight=2.5),
+    ]
+
+    train_loader, _val_loader = make_loaders(
+        train_rows=rows,
+        val_rows=rows,
+        image_size=8,
+        batch_size=2,
+        num_workers=0,
+        sampler_mode="sample_weighted",
+        sample_weight_usage="both",
+        loss_name="class_balanced_focal",
+    )
+
+    assert train_loader.sampler is not None
+    assert list(train_loader.sampler.weights.tolist()) == [1.0, 2.5]
+    assert train_loader.dataset.rows[1].sample_weight == 2.5
+
+
 def test_weighted_soft_cross_entropy_supports_focal_tail_weighting() -> None:
     from src.weather_net.training import weighted_soft_cross_entropy
 

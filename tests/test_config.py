@@ -58,6 +58,36 @@ def test_load_config_accepts_macro_f1_loss_options(tmp_path: Path) -> None:
     assert config.train.sampler_mode == "weighted"
 
 
+def test_load_config_accepts_sample_weighted_sampler_mode(tmp_path: Path) -> None:
+    from src.weather_net.config import load_config
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "train:\n"
+        "  sampler_mode: sample_weighted\n",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert config.train.sampler_mode == "sample_weighted"
+
+
+def test_load_config_accepts_sample_weight_usage(tmp_path: Path) -> None:
+    from src.weather_net.config import load_config
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "train:\n"
+        "  sample_weight_usage: sampler\n",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert config.train.sample_weight_usage == "sampler"
+
+
 def test_load_config_accepts_inference_amp_option(tmp_path: Path) -> None:
     from src.weather_net.config import load_config
 
@@ -182,3 +212,14 @@ def test_convnextv2_384_augmix_jsd_config_is_parseable() -> None:
     assert config.train.jsd_weight == 12.0
     assert config.train.mixup_alpha == 0.0
     assert config.train.cutmix_alpha == 0.0
+
+
+def test_convnextv2_384_hard_finetune_config_is_parseable() -> None:
+    from src.weather_net.config import load_config
+
+    config = load_config(Path("configs/convnextv2_384_hard_finetune.yaml"))
+
+    assert config.model.image_size == 384
+    assert config.train.sampler_mode == "sample_weighted"
+    assert config.train.lr < 0.0002
+    assert config.train.epochs == 8

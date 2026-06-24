@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from collections import Counter
@@ -137,6 +138,8 @@ def build_manifest_from_csv(
             sample_weight = 0.3 + (0.7 * confidence)
         else:
             sample_weight = 1.0
+        if not math.isfinite(sample_weight) or sample_weight <= 0:
+            raise ValueError(f"sample_weight must be finite and positive: {image_id}")
         manifest.append(
             ManifestRow(
                 path=(image_root / image_id).resolve(),

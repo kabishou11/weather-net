@@ -43,6 +43,7 @@ class TrainConfig:
     focal_gamma: float = 0.0
     class_balanced_beta: float = 0.999
     sampler_mode: str = "auto"
+    sample_weight_usage: str = "loss"
     amp: bool = True
     mixup_alpha: float = 0.2
     cutmix_alpha: float = 0.0
@@ -117,8 +118,10 @@ def _validate_config(config: AppConfig) -> None:
         raise ValueError("train.focal_gamma must be non-negative")
     if not 0 <= config.train.class_balanced_beta < 1:
         raise ValueError("train.class_balanced_beta must be in [0, 1)")
-    if config.train.sampler_mode not in {"auto", "none", "weighted"}:
-        raise ValueError("train.sampler_mode must be one of: auto, none, weighted")
+    if config.train.sampler_mode not in {"auto", "none", "weighted", "sample_weighted"}:
+        raise ValueError("train.sampler_mode must be one of: auto, none, weighted, sample_weighted")
+    if config.train.sample_weight_usage not in {"loss", "sampler", "both"}:
+        raise ValueError("train.sample_weight_usage must be one of: loss, sampler, both")
     if config.train.label_smoothing < 0 or config.train.label_smoothing >= 1:
         raise ValueError("train.label_smoothing must be in [0, 1)")
     if config.train.mixup_alpha < 0 or config.train.cutmix_alpha < 0:

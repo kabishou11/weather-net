@@ -5,6 +5,7 @@ import math
 import random
 import time
 from copy import deepcopy
+from dataclasses import replace
 from pathlib import Path
 from typing import Iterable, Sequence
 
@@ -82,10 +83,19 @@ def make_sampler(
     sampler_mode: str = "auto",
     loss_name: str = "ce",
 ) -> WeightedRandomSampler | None:
-    if sampler_mode not in {"auto", "none", "weighted"}:
-        raise ValueError("sampler_mode must be one of: auto, none, weighted")
+    if sampler_mode not in {"auto", "none", "weighted", "sample_weighted"}:
+        raise ValueError("sampler_mode must be one of: auto, none, weighted, sample_weighted")
     if sampler_mode == "none":
         return None
+    if sampler_mode == "sample_weighted":
+        weights = [float(row.sample_weight) for row in rows]
+        if not weights:
+            return None
+        if not all(math.isfinite(weight) and weight > 0 for weight in weights):
+            raise ValueError("sample_weighted sampler requires finite positive sample_weight values")
+        if min(weights) == max(weights):
+            return None
+        return WeightedRandomSampler(weights=weights, num_samples=len(weights), replacement=True)
     if sampler_mode == "auto" and "class_balanced" in loss_name:
         return None
     labels = _labels(rows)
@@ -106,9 +116,18 @@ def make_loaders(
     transform_backend: str = "auto",
     sampler_mode: str = "auto",
     loss_name: str = "ce",
+    sample_weight_usage: str = "loss",
 ) -> tuple[DataLoader, DataLoader]:
+    if sample_weight_usage not in {"loss", "sampler", "both"}:
+        raise ValueError("sample_weight_usage must be one of: loss, sampler, both")
+    sampler_rows = train_rows
+    dataset_train_rows = train_rows
+    if sample_weight_usage == "sampler":
+        dataset_train_rows = [replace(row, sample_weight=1.0) for row in train_rows]
+    elif sample_weight_usage == "loss" and sampler_mode == "sample_weighted":
+        sampler_rows = [replace(row, sample_weight=1.0) for row in train_rows]
     train_dataset = WeatherImageDataset(
-        train_rows,
+        dataset_train_rows,
         transform=build_transforms(
             image_size=image_size,
             train=True,
@@ -125,7 +144,7 @@ def make_loaders(
             backend=transform_backend,
         ),
     )
-    sampler = make_sampler(train_rows, sampler_mode=sampler_mode, loss_name=loss_name)
+    sampler = make_sampler(sampler_rows, sampler_mode=sampler_mode, loss_name=loss_name)
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
@@ -662,6 +681,7 @@ def train_config(config: AppConfig, device_request: str = "auto") -> list[Path]:
             transform_backend=config.data.transform_backend,
             sampler_mode=config.train.sampler_mode,
             loss_name=config.train.loss_name,
+            sample_weight_usage=config.train.sample_weight_usage,
         )
         model = create_classifier(
             config.model.name,

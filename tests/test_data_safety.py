@@ -33,6 +33,17 @@ def test_csv_manifest_preserves_metadata_and_confidence_weight(tmp_path: Path) -
     assert rows[1].sample_weight == pytest.approx(0.86)
 
 
+def test_csv_manifest_rejects_non_positive_sample_weight(tmp_path: Path) -> None:
+    from src.weather_net.data import build_manifest_from_csv
+
+    _make_image(tmp_path / "images" / "a.jpg")
+    csv_path = tmp_path / "train.csv"
+    csv_path.write_text("image,label,sample_weight\na.jpg,rain,0\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="sample_weight"):
+        build_manifest_from_csv(csv_path, image_root=tmp_path / "images")
+
+
 def test_unlabeled_csv_manifest_preserves_original_image_id(tmp_path: Path) -> None:
     from src.weather_net.data import build_unlabeled_manifest_from_csv
 
