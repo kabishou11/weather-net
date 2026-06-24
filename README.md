@@ -123,6 +123,17 @@ python3 infer.py \
 
 `--weights` 会对 logits 做归一化加权；不传时所有 checkpoint 等权平均。
 
+提交前检查推理预算：
+
+```bash
+python3 inference_budget.py \
+  --stats submission.stats.json \
+  --max-seconds-per-image 0.05 \
+  --max-checkpoints 1
+```
+
+`infer.py` 会在输出 CSV 同目录写出 `.stats.json`，其中包含总耗时、单张吞吐、checkpoint 数、TTA 和 AMP 状态。`inference_budget.py` 用它做提交前门控：若超出单张耗时、checkpoint 数或 TTA 预算，会返回非零退出码。省赛同分按推理时间排序时，优先提交通过该门控的 soup 单模型或快速单模型。
+
 使用 OOF 决策参数推理：
 
 ```bash
