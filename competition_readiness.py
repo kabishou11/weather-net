@@ -69,6 +69,90 @@ def _check_nested_oof_decision(decision_dir: Path, require_nested_oof: bool) -> 
     return payload
 
 
+def _resolve_artifact_path(path_value: object, base_dir: Path) -> Path:
+    if not isinstance(path_value, str) or not path_value.strip():
+        raise ValueError("artifact path is empty")
+    path = Path(path_value)
+    if path.is_absolute() or path.exists():
+        return path
+    return base_dir / path
+
+
+def _check_training_artifacts(training_output_dir: Path) -> dict[str, Any]:
+    summary_path = training_output_dir / "training_summary.json"
+    history_csv = training_output_dir / "training_history.csv"
+    history_json = training_output_dir / "training_history.json"
+    curve_png = training_output_dir / "training_curves.png"
+    required_paths = {
+        "summary": summary_path,
+        "history_csv": history_csv,
+        "history_json": history_json,
+        "curve_png": curve_png,
+    }
+    for name, path in required_paths.items():
+        if not path.exists():
+            raise ValueError(f"training artifact is missing: {name} ({path})")
+        if path.stat().st_size <= 0:
+            raise ValueError(f"training artifact is empty: {name} ({path})")
+    if curve_png.read_bytes()[:8] != b"\x89PNG\r\n\x1a\n":
+        raise ValueError(f"training_curves.png is not a PNG file: {curve_png}")
+
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    if not isinstance(summary, list) or not summary:
+        raise ValueError("training_summary.json must contain a non-empty list")
+    missing_summary_keys: list[str] = []
+    for key in ["best_macro_f1", "checkpoint", "training_history_csv", "training_history_json", "training_curves_png"]:
+        if any(key not in item for item in summary if isinstance(item, dict)):
+            missing_summary_keys.append(key)
+    if missing_summary_keys:
+        raise ValueError(f"training_summary.json is missing required keys: {missing_summary_keys}")
+
+    checkpoints: list[str] = []
+    for item in summary:
+        if not isinstance(item, dict):
+            raise ValueError("training_summary.json rows must be JSON objects")
+        checkpoint_path = _resolve_artifact_path(item["checkpoint"], training_output_dir)
+        if not checkpoint_path.exists():
+            raise ValueError(f"checkpoint referenced by training_summary.json does not exist: {checkpoint_path}")
+        checkpoints.append(str(checkpoint_path))
+        for key, expected_path in [
+            ("training_history_csv", history_csv),
+            ("training_history_json", history_json),
+            ("training_curves_png", curve_png),
+        ]:
+            referenced_path = _resolve_artifact_path(item[key], training_output_dir)
+            if referenced_path.resolve() != expected_path.resolve():
+                raise ValueError(f"training_summary.json {key} does not point at {expected_path}")
+
+    oof_metrics_candidates = [
+        _resolve_artifact_path(item["oof_metrics_json"], training_output_dir)
+        for item in summary
+        if isinstance(item, dict) and item.get("oof_metrics_json")
+    ]
+    aggregate_oof_metrics = training_output_dir / "oof" / "oof_metrics.json"
+    if aggregate_oof_metrics.exists():
+        oof_metrics_candidates.append(aggregate_oof_metrics)
+    if not oof_metrics_candidates:
+        raise ValueError("OOF metrics are required for competition readiness")
+    missing_oof = [str(path) for path in oof_metrics_candidates if not path.exists() or path.stat().st_size <= 0]
+    if missing_oof:
+        raise ValueError(f"OOF metrics referenced by training artifacts are missing or empty: {missing_oof}")
+
+    history_payload = json.loads(history_json.read_text(encoding="utf-8"))
+    if not isinstance(history_payload, list) or not history_payload:
+        raise ValueError("training_history.json must contain a non-empty list")
+    return {
+        "output_dir": str(training_output_dir),
+        "summary": str(summary_path),
+        "history_csv": str(history_csv),
+        "history_json": str(history_json),
+        "curve_png": str(curve_png),
+        "checkpoints": checkpoints,
+        "oof_metrics": sorted({str(path) for path in oof_metrics_candidates}),
+        "epochs_recorded": len(history_payload),
+    }
+
+
 def run_readiness_checks(
     config_path: Path,
     train_csv: Path | None = None,
@@ -91,6 +175,7 @@ def run_readiness_checks(
     allow_tta: bool = False,
     decision_dir: Path | None = None,
     require_nested_oof: bool = False,
+    training_output_dir: Path | None = None,
 ) -> dict[str, Any]:
     gates: dict[str, Any] = {}
     violations: list[dict[str, str]] = []
@@ -145,6 +230,14 @@ def run_readiness_checks(
         message = "--decision-dir is required when --require-nested-oof is set"
         gates["nested_oof_decision"] = _fail(message)
         violations.append(_violation("nested_oof_decision", message))
+
+    if training_output_dir is not None:
+        try:
+            gates["training_artifacts"] = _pass(_check_training_artifacts(training_output_dir))
+        except Exception as error:
+            message = str(error)
+            gates["training_artifacts"] = _fail(message)
+            violations.append(_violation("training_artifacts", message))
 
     if inference_stats is not None:
         try:
@@ -201,6 +294,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--allow-tta", action="store_true")
     parser.add_argument("--decision-dir", type=Path, default=None)
     parser.add_argument("--require-nested-oof", action="store_true")
+    parser.add_argument("--training-output-dir", type=Path, default=None)
     parser.add_argument("--output", type=Path, default=None)
     return parser.parse_args()
 
@@ -229,6 +323,7 @@ def main() -> None:
         allow_tta=args.allow_tta,
         decision_dir=args.decision_dir,
         require_nested_oof=args.require_nested_oof,
+        training_output_dir=args.training_output_dir,
     )
     text = json.dumps(report, indent=2, ensure_ascii=False) + "\n"
     if args.output is not None:

@@ -63,6 +63,14 @@ python3 train.py \
 
 `convnextv2_384.yaml` 面向 24G 4090 设计，主线是 ConvNeXtV2 预训练骨干、384 输入、WeatherAugMix、EMA、MixUp/CutMix，以及 `class_balanced_focal` 长尾损失。这个组合对齐 macro F1：少数天气类会获得更高训练权重，focal 项会让模型更关注难样本。不要只看单次验证分数，最终以 5-fold OOF macro F1、每类 F1 和混淆矩阵判断是否保留。
 
+训练时会显示 batch 级进度条，并在每个 epoch 结束打印一行 JSON 指标，包含 `train_loss`、`val_loss`、`macro_f1`、`accuracy`、`seconds`、当前 fold 和 epoch。训练结束后，`--output-dir` 会写出：
+
+- `training_summary.json`：每折最佳 epoch、最佳 macro F1、每类 F1、混淆矩阵、checkpoint 路径、OOF 产物路径。
+- `training_history.csv`：逐 epoch 表格，适合复制到表格或画自定义图。
+- `training_history.json`：逐 epoch 原始记录，适合脚本汇总。
+- `training_curves.png`：训练 loss、验证 loss、macro F1、accuracy 曲线，迁移服务器后优先看这张图判断过拟合、增强过强和外部数据污染。
+- `oof/`：每折和全量 OOF 的预测、概率和指标文件，是 hard mining、model soup、OOF 决策层的输入。
+
 长尾先验校正对照：
 
 ```bash
@@ -123,6 +131,7 @@ python3 competition_readiness.py \
   --allow-external-data \
   --external-max-ratio 0.5 \
   --external-max-sample-weight 0.5 \
+  --training-output-dir outputs/convnextv2_384 \
   --decision-dir outputs/decision/convnextv2_384_nested \
   --require-nested-oof \
   --inference-stats outputs/submission/submission.stats.json \
@@ -131,7 +140,7 @@ python3 competition_readiness.py \
   --output outputs/readiness/convnextv2_384_readiness.json
 ```
 
-只有报告里的 `status` 为 `pass` 且 `recommendation` 为 `ready_for_server_training`，才进入服务器训练或冻结提交包。若还没有 OOF/推理产物，可以先不传 `--decision-dir/--inference-stats`，但最终提交前必须补齐这两个证据；省赛同分看推理时间时，优先选择通过该门控的 soup 单模型或快速单模型。
+只有报告里的 `status` 为 `pass` 且 `recommendation` 为 `ready_for_server_training`，才进入服务器训练或冻结提交包。若是训练前第一次预检，可以先不传 `--training-output-dir/--decision-dir/--inference-stats`；训练完成和最终提交前必须补齐这三类证据。`--training-output-dir` 会检查 checkpoint、`training_summary.json`、逐 epoch history、曲线 PNG 和 OOF metrics 是否存在且互相引用正确。省赛同分看推理时间时，优先选择通过该门控的 soup 单模型或快速单模型。
 
 ## 推理
 

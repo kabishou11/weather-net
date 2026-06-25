@@ -88,6 +88,44 @@ def _write_decision_dir(path: Path, *, nested_accepted: bool = True) -> None:
     )
 
 
+def _write_training_output_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    checkpoint = path / "soup.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    (path / "training_history.csv").write_text(
+        "fold,epoch,train_loss,val_loss,macro_f1,accuracy\n0,1,0.7,0.6,0.8,0.85\n",
+        encoding="utf-8",
+    )
+    (path / "training_history.json").write_text(
+        json.dumps([{"fold": 0, "epoch": 1, "macro_f1": 0.8}]),
+        encoding="utf-8",
+    )
+    (path / "training_curves.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+    oof_dir = path / "oof"
+    oof_dir.mkdir()
+    (oof_dir / "oof_metrics.json").write_text(
+        json.dumps({"macro_f1": 0.8, "per_class_f1": {"rain": 0.8, "sunny": 0.8}}),
+        encoding="utf-8",
+    )
+    (path / "training_summary.json").write_text(
+        json.dumps(
+            [
+                {
+                    "fold": 0,
+                    "best_epoch": 1,
+                    "best_macro_f1": 0.8,
+                    "checkpoint": str(checkpoint),
+                    "training_history_csv": str(path / "training_history.csv"),
+                    "training_history_json": str(path / "training_history.json"),
+                    "training_curves_png": str(path / "training_curves.png"),
+                    "oof_metrics_json": str(oof_dir / "oof_metrics.json"),
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+
 def _merge_fixture(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
     from merge_external_training import merge_labeled_with_external_data
 
@@ -244,6 +282,46 @@ def test_readiness_passes_clean_external_nested_and_budget_evidence(tmp_path: Pa
     assert report["gates"]["server_strict_preflight"]["status"] == "pass"
     assert report["gates"]["nested_oof_decision"]["status"] == "pass"
     assert report["gates"]["inference_budget"]["status"] == "pass"
+
+
+def test_readiness_checks_training_output_artifacts(tmp_path: Path) -> None:
+    from competition_readiness import run_readiness_checks
+
+    train_csv, image_root, class_map, audit_json = _merge_fixture(tmp_path)
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path, train_csv, image_root, class_map, audit_json)
+    training_output_dir = tmp_path / "outputs"
+    _write_training_output_dir(training_output_dir)
+
+    report = run_readiness_checks(
+        config_path=config_path,
+        allow_external_data=True,
+        training_output_dir=training_output_dir,
+    )
+
+    assert report["status"] == "pass"
+    assert report["gates"]["training_artifacts"]["status"] == "pass"
+    assert report["gates"]["training_artifacts"]["summary"] == str(training_output_dir / "training_summary.json")
+
+
+def test_readiness_fails_when_training_curve_is_missing(tmp_path: Path) -> None:
+    from competition_readiness import run_readiness_checks
+
+    train_csv, image_root, class_map, audit_json = _merge_fixture(tmp_path)
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path, train_csv, image_root, class_map, audit_json)
+    training_output_dir = tmp_path / "outputs"
+    _write_training_output_dir(training_output_dir)
+    (training_output_dir / "training_curves.png").unlink()
+
+    report = run_readiness_checks(
+        config_path=config_path,
+        allow_external_data=True,
+        training_output_dir=training_output_dir,
+    )
+
+    assert report["status"] == "fail"
+    assert any(item["gate"] == "training_artifacts" for item in report["violations"])
 
 
 def test_competition_readiness_cli_writes_report_and_exits_nonzero_on_failure(

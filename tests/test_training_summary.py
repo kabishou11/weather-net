@@ -58,6 +58,55 @@ def test_build_fold_summary_can_include_oof_artifacts() -> None:
     assert summary["oof_metrics_json"] == "outputs/oof/oof_metrics.json"
 
 
+def test_write_training_history_artifacts_outputs_csv_json_and_png(tmp_path) -> None:
+    import csv
+    import json
+
+    from src.weather_net.training import write_training_history_artifacts
+
+    history = [
+        {
+            "fold": 0,
+            "epoch": 1,
+            "loss_name": "class_balanced_focal",
+            "effective_loss_name": "ce",
+            "train_loss": 0.8,
+            "val_loss": 0.7,
+            "macro_f1": 0.55,
+            "accuracy": 0.6,
+            "ema": True,
+            "seconds": 12.0,
+            "best_so_far": True,
+        },
+        {
+            "fold": 0,
+            "epoch": 2,
+            "loss_name": "class_balanced_focal",
+            "effective_loss_name": "class_balanced_focal",
+            "train_loss": 0.5,
+            "val_loss": 0.6,
+            "macro_f1": 0.7,
+            "accuracy": 0.72,
+            "ema": True,
+            "seconds": 11.0,
+            "best_so_far": True,
+        },
+    ]
+
+    artifacts = write_training_history_artifacts(tmp_path, history)
+
+    assert artifacts["csv"] == str(tmp_path / "training_history.csv")
+    assert artifacts["json"] == str(tmp_path / "training_history.json")
+    assert artifacts["curve_png"] == str(tmp_path / "training_curves.png")
+    with (tmp_path / "training_history.csv").open("r", encoding="utf-8", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    assert rows[0]["fold"] == "0"
+    assert rows[1]["macro_f1"] == "0.700000"
+    payload = json.loads((tmp_path / "training_history.json").read_text(encoding="utf-8"))
+    assert payload[1]["epoch"] == 2
+    assert (tmp_path / "training_curves.png").read_bytes().startswith(b"\x89PNG")
+
+
 def test_collect_oof_predictions_returns_logits_and_ids(tmp_path) -> None:
     import torch
     from torch import nn
@@ -193,6 +242,90 @@ def test_train_config_passes_optimizer_group_options(monkeypatch, tmp_path) -> N
 
     assert seen["no_weight_decay"] is True
     assert seen["layer_decay"] == 0.85
+
+
+def test_train_config_writes_history_artifacts_and_links_summary(monkeypatch, tmp_path) -> None:
+    import json
+    import torch
+    from torch import nn
+
+    from src.weather_net.config import AppConfig
+    from src.weather_net.data import ManifestRow
+    from src.weather_net.metrics import ClassificationReport
+    from src.weather_net import training
+
+    def fake_manifest(_config):
+        rows = [
+            ManifestRow(path=tmp_path / "rain.jpg", label=0, label_name="rain", image_id="rain.jpg"),
+            ManifestRow(path=tmp_path / "sunny.jpg", label=1, label_name="sunny", image_id="sunny.jpg"),
+        ]
+        return rows, {"rain": 0, "sunny": 1}
+
+    def fake_loaders(train_rows, val_rows, **_kwargs):
+        return object(), object()
+
+    class TinyModel(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.head = nn.Linear(1, 2)
+
+    train_losses = [0.4, 0.3]
+    eval_values = [(0.8, 0.51), (0.6, 0.73)]
+
+    def fake_train_one_epoch(*_args, **_kwargs):
+        return train_losses.pop(0)
+
+    def fake_evaluate(*_args, **_kwargs):
+        val_loss, macro_f1 = eval_values.pop(0)
+        return (
+            ClassificationReport(
+                macro_f1=macro_f1,
+                accuracy=macro_f1 + 0.1,
+                per_class_f1={"rain": macro_f1, "sunny": macro_f1},
+                confusion_matrix=[[1, 0], [0, 1]],
+            ),
+            val_loss,
+        )
+
+    monkeypatch.setattr(training, "load_training_manifest", fake_manifest)
+    monkeypatch.setattr(training, "make_loaders", fake_loaders)
+    monkeypatch.setattr(training, "create_classifier", lambda *_args, **_kwargs: TinyModel())
+    monkeypatch.setattr(
+        training,
+        "build_optimizer",
+        lambda model, *_args, **_kwargs: torch.optim.SGD(model.parameters(), lr=0.1),
+    )
+    monkeypatch.setattr(training, "train_one_epoch", fake_train_one_epoch)
+    monkeypatch.setattr(training, "evaluate", fake_evaluate)
+    monkeypatch.setattr(training, "save_checkpoint", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(training, "collect_oof_predictions", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(training, "write_oof_artifacts", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(training.torch, "load", lambda *_args, **_kwargs: {"model_state": TinyModel().state_dict()})
+
+    class NoopScheduler:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        def step(self) -> None:
+            pass
+
+    monkeypatch.setattr(training.torch.optim.lr_scheduler, "CosineAnnealingLR", NoopScheduler)
+
+    config = AppConfig()
+    config.data.folds = 1
+    config.train.epochs = 2
+    config.train.output_dir = tmp_path / "outputs"
+
+    training.train_config(config, device_request="cpu")
+
+    summary = json.loads((config.train.output_dir / "training_summary.json").read_text(encoding="utf-8"))
+    assert (config.train.output_dir / "training_history.csv").exists()
+    assert (config.train.output_dir / "training_history.json").exists()
+    assert (config.train.output_dir / "training_curves.png").exists()
+    assert summary[0]["training_history_csv"] == str(config.train.output_dir / "training_history.csv")
+    assert summary[0]["training_history_json"] == str(config.train.output_dir / "training_history.json")
+    assert summary[0]["training_curves_png"] == str(config.train.output_dir / "training_curves.png")
+    assert summary[0]["epochs"] == 2
 
 
 def test_training_rejects_external_rows_without_merge_audit(monkeypatch, tmp_path) -> None:

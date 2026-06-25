@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 import hashlib
 import math
@@ -9,12 +10,14 @@ import time
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Any, Iterable, Sequence
 
 import numpy as np
 import torch
+from PIL import Image, ImageDraw
 from torch import nn
 from torch.utils.data import DataLoader, WeightedRandomSampler
+from tqdm.auto import tqdm
 
 from .config import AppConfig, resolve_device
 from .data import (
@@ -681,6 +684,10 @@ def split_augmix_jsd_batch(images) -> tuple[torch.Tensor, list[torch.Tensor]]:
     return clean, [aug1, aug2]
 
 
+def _progress(iterable: Iterable, description: str):
+    return tqdm(iterable, desc=description, leave=False, dynamic_ncols=True)
+
+
 def augmix_jsd_loss(
     clean_logits: torch.Tensor,
     aug1_logits: torch.Tensor,
@@ -760,7 +767,7 @@ def train_one_epoch(
     if use_ldam and ldam_margins is None:
         raise ValueError("ldam_margins is required when loss_name is ldam")
 
-    for batch in loader:
+    for batch in _progress(loader, f"train epoch {epoch}"):
         images, targets, sample_weights, teacher_probs = unpack_training_batch(batch)
         images, augmix_views = split_augmix_jsd_batch(images)
         if jsd_weight > 0 and not augmix_views:
@@ -897,7 +904,7 @@ def evaluate(
     total_loss = 0.0
     total_items = 0
     criterion = nn.CrossEntropyLoss(reduction="none")
-    for batch in loader:
+    for batch in _progress(loader, "validate"):
         images, targets, sample_weights, _teacher_probs = unpack_training_batch(batch)
         images = images.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
@@ -1007,12 +1014,159 @@ def save_checkpoint(
     )
 
 
+def _format_history_value(value: object) -> object:
+    if isinstance(value, bool):
+        return str(value).lower()
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        return f"{value:.6f}"
+    return value
+
+
+def _draw_series(
+    draw: ImageDraw.ImageDraw,
+    points: list[tuple[int, float]],
+    color: str,
+    box: tuple[int, int, int, int],
+    minimum_x: int,
+    maximum_x: int,
+    minimum: float,
+    maximum: float,
+) -> None:
+    if not points:
+        return
+    left, top, right, bottom = box
+    span_x = max(1, maximum_x - minimum_x)
+    span_y = max(1e-8, maximum - minimum)
+    coords: list[tuple[int, int]] = []
+    for epoch, value in points:
+        x = left + int((epoch - minimum_x) / span_x * (right - left))
+        y = bottom - int((value - minimum) / span_y * (bottom - top))
+        coords.append((x, y))
+    if len(coords) == 1:
+        x, y = coords[0]
+        draw.ellipse((x - 3, y - 3, x + 3, y + 3), fill=color)
+        return
+    draw.line(coords, fill=color, width=3)
+    for x, y in coords:
+        draw.ellipse((x - 2, y - 2, x + 2, y + 2), fill=color)
+
+
+def _write_training_curve_png(path: Path, history: Sequence[dict[str, Any]]) -> None:
+    width, height = 1000, 620
+    margin_left, margin_top, margin_right, margin_bottom = 92, 64, 42, 86
+    plot_box = (margin_left, margin_top, width - margin_right, height - margin_bottom)
+    image = Image.new("RGB", (width, height), "white")
+    draw = ImageDraw.Draw(image)
+    draw.rectangle(plot_box, outline="#1f2937", width=2)
+    draw.text((margin_left, 24), "Weather Net training curves", fill="#111827")
+
+    if not history:
+        draw.text((margin_left + 24, margin_top + 24), "No epoch history recorded.", fill="#6b7280")
+        image.save(path)
+        return
+
+    metric_names = ["train_loss", "val_loss", "macro_f1", "accuracy"]
+    colors = {
+        "train_loss": "#ef4444",
+        "val_loss": "#f59e0b",
+        "macro_f1": "#2563eb",
+        "accuracy": "#16a34a",
+    }
+    values = [
+        float(row[name])
+        for row in history
+        for name in metric_names
+        if name in row and isinstance(row[name], (int, float)) and math.isfinite(float(row[name]))
+    ]
+    minimum = min(values) if values else 0.0
+    maximum = max(values) if values else 1.0
+    if math.isclose(minimum, maximum):
+        minimum -= 0.05
+        maximum += 0.05
+    padding = (maximum - minimum) * 0.08
+    minimum -= padding
+    maximum += padding
+
+    for idx in range(6):
+        y = plot_box[3] - int(idx / 5 * (plot_box[3] - plot_box[1]))
+        draw.line((plot_box[0], y, plot_box[2], y), fill="#e5e7eb")
+        value = minimum + idx / 5 * (maximum - minimum)
+        draw.text((12, y - 8), f"{value:.3f}", fill="#4b5563")
+
+    max_epoch = max(int(row.get("epoch", 0)) for row in history)
+    folds = sorted({int(row.get("fold", 0)) for row in history})
+    all_epoch_positions = [
+        int(row.get("fold", 0)) * (max_epoch + 1) + int(row.get("epoch", 0))
+        for row in history
+    ]
+    minimum_x = min(all_epoch_positions)
+    maximum_x = max(all_epoch_positions)
+    for fold in folds:
+        fold_rows = [row for row in history if int(row.get("fold", 0)) == fold]
+        epoch_offset = fold * (max_epoch + 1)
+        for name in metric_names:
+            points = [
+                (epoch_offset + int(row["epoch"]), float(row[name]))
+                for row in fold_rows
+                if name in row and isinstance(row[name], (int, float))
+            ]
+            _draw_series(draw, points, colors[name], plot_box, minimum_x, maximum_x, minimum, maximum)
+
+    legend_x = margin_left
+    legend_y = height - 52
+    for name in metric_names:
+        draw.line((legend_x, legend_y + 8, legend_x + 30, legend_y + 8), fill=colors[name], width=3)
+        draw.text((legend_x + 38, legend_y), name, fill="#111827")
+        legend_x += 180
+    draw.text((margin_left, height - 28), "X axis: epoch, folds are offset in sequence for readability.", fill="#6b7280")
+    image.save(path)
+
+
+def write_training_history_artifacts(
+    output_dir: Path,
+    history: Sequence[dict[str, Any]],
+) -> dict[str, str]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = output_dir / "training_history.csv"
+    json_path = output_dir / "training_history.json"
+    curve_path = output_dir / "training_curves.png"
+    fieldnames = [
+        "fold",
+        "epoch",
+        "loss_name",
+        "effective_loss_name",
+        "train_loss",
+        "val_loss",
+        "macro_f1",
+        "accuracy",
+        "ema",
+        "seconds",
+        "best_so_far",
+    ]
+    with csv_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for item in history:
+            writer.writerow({field: _format_history_value(item.get(field, "")) for field in fieldnames})
+    json_path.write_text(json.dumps(list(history), indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    _write_training_curve_png(curve_path, history)
+    return {
+        "csv": str(csv_path),
+        "json": str(json_path),
+        "curve_png": str(curve_path),
+    }
+
+
 def build_fold_summary(
     fold: int,
     best_epoch: int,
     best_val_loss: float,
     checkpoint: str,
     report: ClassificationReport,
+    epochs: int | None = None,
+    history_artifacts: dict[str, str] | None = None,
     oof_artifacts: OofArtifactPaths | None = None,
 ) -> dict[str, object]:
     summary: dict[str, object] = {
@@ -1025,6 +1179,16 @@ def build_fold_summary(
         "per_class_f1": report.per_class_f1,
         "confusion_matrix": report.confusion_matrix,
     }
+    if epochs is not None:
+        summary["epochs"] = epochs
+    if history_artifacts is not None:
+        summary.update(
+            {
+                "training_history_csv": history_artifacts["csv"],
+                "training_history_json": history_artifacts["json"],
+                "training_curves_png": history_artifacts["curve_png"],
+            }
+        )
     if oof_artifacts is not None:
         summary.update(
             {
@@ -1062,6 +1226,7 @@ def train_config(config: AppConfig, device_request: str = "auto") -> list[Path]:
     checkpoint_paths: list[Path] = []
     summary: list[dict[str, object]] = []
     all_oof_records: list[OofRecord] = []
+    training_history: list[dict[str, Any]] = []
     for fold, train_rows, val_rows in _fold_plan(
         rows,
         folds=config.data.folds,
@@ -1155,6 +1320,25 @@ def train_config(config: AppConfig, device_request: str = "auto") -> list[Path]:
             report, val_loss = evaluate(eval_model, val_loader, device=device, class_names=class_names)
             scheduler.step()
             elapsed = time.perf_counter() - started
+            is_best = report.macro_f1 > best_f1
+            epoch_record: dict[str, Any] = {
+                "fold": fold,
+                "epoch": epoch,
+                "loss_name": config.train.loss_name,
+                "effective_loss_name": effective_loss_name_for_epoch(
+                    config.train.loss_name,
+                    epoch=epoch,
+                    loss_warmup_epochs=config.train.loss_warmup_epochs,
+                ),
+                "train_loss": float(train_loss),
+                "val_loss": float(val_loss),
+                "macro_f1": float(report.macro_f1),
+                "accuracy": float(report.accuracy),
+                "ema": model_ema is not None,
+                "seconds": float(elapsed),
+                "best_so_far": is_best,
+            }
+            training_history.append(epoch_record)
             print(
                 json.dumps(
                     {
@@ -1176,7 +1360,7 @@ def train_config(config: AppConfig, device_request: str = "auto") -> list[Path]:
                     ensure_ascii=False,
                 )
             )
-            if report.macro_f1 > best_f1:
+            if is_best:
                 best_f1 = report.macro_f1
                 best_epoch = epoch
                 best_val_loss = val_loss
@@ -1256,6 +1440,12 @@ def train_config(config: AppConfig, device_request: str = "auto") -> list[Path]:
     if external_merge_audit is not None:
         for item in summary:
             item["external_merge_audit"] = external_merge_audit
+    history_artifacts = write_training_history_artifacts(output_dir, training_history)
+    for item in summary:
+        item["epochs"] = config.train.epochs
+        item["training_history_csv"] = history_artifacts["csv"]
+        item["training_history_json"] = history_artifacts["json"]
+        item["training_curves_png"] = history_artifacts["curve_png"]
     (output_dir / "training_summary.json").write_text(
         json.dumps(summary, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
