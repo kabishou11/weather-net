@@ -110,6 +110,29 @@ python3 train.py \
 
 如果显存紧张，优先把 `batch_size` 下调到 16 或 12，保持 384 输入和预训练骨干；如果训练时间紧，优先跑 3 折 OOF，再用最佳配置补 5 折。推理默认使用 fp32 以保持概率和伪标签阈值稳定；确认本地/线上 F1 不受影响后，可在配置中设置 `infer.amp: true` 或命令行加 `--amp` 换取速度。
 
+## 服务器训练前总闸
+
+正式迁移服务器或启动长时间训练前，先跑 fail-closed readiness gate。它会复用 `server-strict` 预检，强制检查 CSV 类映射、外部数据 merge audit、真实标注样本是否支撑 K 折、图片可读性和内容哈希唯一性；如果已经有 OOF 决策层与推理统计，还会继续检查 nested OOF scorecard 和提交推理预算。
+
+```bash
+python3 competition_readiness.py \
+  --config configs/convnextv2_384.yaml \
+  --train-csv data/train_with_external_common5.csv \
+  --image-root . \
+  --class-map outputs/official/class_to_idx.json \
+  --allow-external-data \
+  --external-max-ratio 0.5 \
+  --external-max-sample-weight 0.5 \
+  --decision-dir outputs/decision/convnextv2_384_nested \
+  --require-nested-oof \
+  --inference-stats outputs/submission/submission.stats.json \
+  --max-seconds-per-image 0.05 \
+  --max-checkpoints 1 \
+  --output outputs/readiness/convnextv2_384_readiness.json
+```
+
+只有报告里的 `status` 为 `pass` 且 `recommendation` 为 `ready_for_server_training`，才进入服务器训练或冻结提交包。若还没有 OOF/推理产物，可以先不传 `--decision-dir/--inference-stats`，但最终提交前必须补齐这两个证据；省赛同分看推理时间时，优先选择通过该门控的 soup 单模型或快速单模型。
+
 ## 推理
 
 ```bash
